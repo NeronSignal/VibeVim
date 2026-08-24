@@ -386,6 +386,10 @@ local ensure_center_editor_window
 local open_edited_files_in_center
 local collapse_pending_codex_diff
 local install_codex_diff_navigation
+-- The inline diff controls are also rendered as a small, draggable floating
+-- toolbar.  The forward declaration lets the Codex file watcher request a
+-- refresh before the toolbar implementation is reached during startup.
+local schedule_diff_toolbar_refresh
 
 -- Codex CLI'nin YOLO ayarı ile codex.nvim'in openDiff onayı birbirinden
 -- bağımsızdır.  Bu küçük köprü, yalnızca gerçekten YOLO/full-access açıkken
@@ -1217,6 +1221,12 @@ local function apply_diff_highlights()
   for _, name in ipairs({ "GitSignsChangePreview" }) do
     set_group(name, change)
   end
+
+  -- Floating Codex controls remain legible in both light and dark themes.
+  -- Keep these as dedicated groups so users can override just the toolbar
+  -- without changing the editor's green/red diff contract.
+  set_group("VibeVimDiffToolbar", { bg = "#20252b", fg = "#f4f7fb", bold = true })
+  set_group("VibeVimDiffToolbarBorder", { bg = "#20252b", fg = "#7aa2f7", bold = true })
 end
 
 _G.ApplyDiffHighlights = apply_diff_highlights
@@ -1858,6 +1868,9 @@ local function enable_codex_inline_overlay(bufnr, reference_lines)
       pcall(mini_diff.toggle_overlay, bufnr)
     end
     vim.cmd("redraw!")
+    if schedule_diff_toolbar_refresh then
+      schedule_diff_toolbar_refresh(bufnr)
+    end
   end
   -- Git references are populated asynchronously; toggling after the next
   -- event-loop turn keeps the overlay active for both fast and slow repos.
@@ -2089,50 +2102,130 @@ local function reference_text_lines(text)
   return lines
 end
 
-local function accept_codex_hunk(bufnr)
-  bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
-  local data, mini_diff = mini_diff_data_for_buffer(bufnr)
-  if not data or not mini_diff or type(mini_diff.set_ref_text) ~= "function" then
-    vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
-    return false
+-- Find the native codex.nvim diff belonging to a centre-editor buffer.  A new
+-- file has no on-disk baseline, so mini.diff can legitimately be one event
+-- behind (or even have no hunk yet) while codex.nvim is already waiting for
+-- the user's decision.  Keeping this lookup separate lets the same Accept
+-- button resolve both kinds of diff.
+local function native_codex_diff_for_buffer(bufnr)
+  local ok, diff = pcall(require, "codex.diff")
+  if not ok or type(diff) ~= "table" or type(diff._get_active_diffs) ~= "function" then
+    return nil, nil, nil
   end
-  local hunk = hunk_for_cursor(data, bufnr)
-  local current_lines = codex_buffer_lines(bufnr)
-  local ref_lines = reference_text_lines(data.ref_text)
-  if not hunk or not current_lines or not ref_lines then
-    vim.notify("Codex değişiklik temeli henüz hazır değil", vim.log.levels.WARN)
-    return false
+  local active = diff._get_active_diffs()
+  if type(active) ~= "table" then
+    return nil, nil, nil
   end
 
-  local ref_start = math.max(1, tonumber(hunk.ref_start) or 1)
-  local ref_count = math.max(0, tonumber(hunk.ref_count) or 0)
-  local buf_start = math.max(1, tonumber(hunk.buf_start) or 1)
-  local buf_count = math.max(0, tonumber(hunk.buf_count) or 0)
-  local next_ref = {}
-  for index = 1, math.min(ref_start - 1, #ref_lines) do
-    next_ref[#next_ref + 1] = ref_lines[index]
-  end
-  for index = buf_start, math.min(buf_start + buf_count - 1, #current_lines) do
-    next_ref[#next_ref + 1] = current_lines[index]
-  end
-  local after = ref_start + ref_count
-  for index = after, #ref_lines do
-    next_ref[#next_ref + 1] = ref_lines[index]
+  local tab_name = vim.b[bufnr].codex_diff_tab_name
+  if type(tab_name) == "string" and type(active[tab_name]) == "table" then
+    local state = active[tab_name]
+    if state.new_buffer == bufnr or state.status == "pending" then
+      return diff, tab_name, state
+    end
   end
 
   local path = vim.b[bufnr].codex_diff_file_path
   if type(path) ~= "string" or path == "" then
     path = vim.api.nvim_buf_get_name(bufnr)
   end
-  remember_codex_diff_baseline(path, next_ref)
-  vim.b[bufnr].codex_diff_reference_lines = vim.deepcopy(next_ref)
-  pcall(mini_diff.set_ref_text, bufnr, next_ref)
+  path = type(path) == "string" and vim.fn.fnamemodify(path, ":p") or ""
+  for name, state in pairs(active) do
+    if type(state) == "table" and state.status == "pending"
+        and (state.new_buffer == bufnr
+          or (path ~= "" and type(state.old_file_path) == "string"
+            and vim.fn.fnamemodify(state.old_file_path, ":p") == path)) then
+      return diff, name, state
+    end
+  end
+  return nil, nil, nil
+end
+
+local function accept_all_codex_hunks(bufnr)
+  bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local data, mini_diff = mini_diff_data_for_buffer(bufnr)
+  local native_diff, native_tab_name, native_state = native_codex_diff_for_buffer(bufnr)
+  local is_codex_buffer = vim.b[bufnr].personal_codex_diff == true
+    or vim.b[bufnr].codex_diff_tab_name ~= nil
+    or native_state ~= nil
+  if not is_codex_buffer then
+    vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    return false
+  end
+
+  local current_lines = codex_buffer_lines(bufnr)
+  if not current_lines then
+    vim.notify("Codex dosyasının içeriği okunamadı", vim.log.levels.WARN)
+    return false
+  end
+
+  -- Prefer mini.diff's live reference, but retain the explicit snapshot used
+  -- for Codex buffers when the asynchronous hunk calculation is not ready.
+  local ref_lines
+  if data and data.ref_text ~= nil then
+    ref_lines = reference_text_lines(data.ref_text)
+  end
+  if not ref_lines and type(vim.b[bufnr].codex_diff_reference_lines) == "table" then
+    ref_lines = vim.deepcopy(vim.b[bufnr].codex_diff_reference_lines)
+  end
+  local path = vim.b[bufnr].codex_diff_file_path
+  if type(path) ~= "string" or path == "" then
+    path = vim.api.nvim_buf_get_name(bufnr)
+  end
+  if not ref_lines and type(path) == "string" and path ~= "" then
+    ref_lines = codex_diff_baseline_for(path)
+  end
+
+  local has_hunks = data and type(data.hunks) == "table" and #data.hunks > 0
+  local differs = ref_lines and not vim.deep_equal(current_lines, ref_lines)
+  local native_pending = native_state and native_state.status == "pending"
+  if not has_hunks and not differs and not native_pending then
+    vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    return false
+  end
+
+  -- Move the complete current file into the in-memory baseline.  This is an
+  -- atomic all-hunks operation: no hunk is selected by cursor position, and a
+  -- new file's empty reference is handled correctly.
+  remember_codex_diff_baseline(path, current_lines)
+  vim.b[bufnr].codex_diff_reference_lines = vim.deepcopy(current_lines)
+  mini_diff = mini_diff or ensure_mini_diff()
+  if mini_diff and type(mini_diff.set_ref_text) == "function" then
+    local ok, err = pcall(mini_diff.set_ref_text, bufnr, current_lines)
+    if not ok then
+      vim.notify("Inline diff temeli güncellenemedi: " .. tostring(err), vim.log.levels.WARN)
+    end
+  end
+
+  -- Resolve the pending MCP operation as well.  This is especially important
+  -- for a newly-created file: there is no Git path yet, but codex.nvim still
+  -- has a pending new_buffer that must receive FILE_SAVED.
+  if native_pending and native_diff and type(native_diff._resolve_diff_as_saved) == "function" then
+    local ok, err = pcall(native_diff._resolve_diff_as_saved, native_tab_name, bufnr)
+    if not ok then
+      vim.notify("Codex değişikliği kabul edilemedi: " .. tostring(err), vim.log.levels.WARN)
+      return false
+    end
+  end
+
   vim.schedule(function()
     pcall(vim.cmd, "redrawtabline")
+    if schedule_diff_toolbar_refresh then
+      schedule_diff_toolbar_refresh(bufnr)
+    end
   end)
-  vim.notify("Bu değişiklik kabul edildi; tekrar değişene kadar gizlendi", vim.log.levels.INFO)
+  vim.notify("Dosyadaki tüm Codex değişiklikleri kabul edildi", vim.log.levels.INFO)
   return true
 end
+
+-- Keep the old internal name as a compatibility alias for header mappings and
+-- user commands created by earlier VibeVim versions.  It now intentionally
+-- means “accept the whole file”.
+local accept_codex_hunk = accept_all_codex_hunks
 
 local function goto_codex_hunk(direction, bufnr)
   bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
@@ -2153,7 +2246,288 @@ local function goto_codex_hunk(direction, bufnr)
     vim.notify("Değişiklik konumuna gidilemedi: " .. tostring(err), vim.log.levels.WARN)
     return false
   end
+  if schedule_diff_toolbar_refresh then
+    schedule_diff_toolbar_refresh(bufnr)
+  end
   return true
+end
+
+-- A compact editor-local toolbar keeps the diff controls close to the code
+-- instead of forcing the user to reach the global header.  It is deliberately
+-- a normal focusable floating window for reliable mouse events, but it is
+-- opened with `enter = false` and every refresh restores the previous window,
+-- so an active Codex prompt never loses its input focus.
+local diff_toolbar_win
+local diff_toolbar_buf
+local diff_toolbar_target_buf
+local diff_toolbar_drag
+local diff_toolbar_refresh_pending = false
+local diff_toolbar_pending_buf
+
+local function close_diff_toolbar()
+  diff_toolbar_drag = nil
+  diff_toolbar_target_buf = nil
+  local winid = diff_toolbar_win
+  diff_toolbar_win = nil
+  if winid and vim.api.nvim_win_is_valid(winid) then
+    pcall(vim.api.nvim_win_close, winid, true)
+  end
+  if diff_toolbar_buf and vim.api.nvim_buf_is_valid(diff_toolbar_buf) then
+    pcall(vim.api.nvim_buf_delete, diff_toolbar_buf, { force = true })
+  end
+  diff_toolbar_buf = nil
+end
+
+local function diff_toolbar_target_window(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  local candidates = vim.fn.win_findbuf(bufnr)
+  for _, winid in ipairs(candidates) do
+    if vim.api.nvim_win_is_valid(winid) then
+      local cfg = vim.api.nvim_win_get_config(winid)
+      if cfg.relative == "" and vim.bo[bufnr].buftype == "" then
+        return winid
+      end
+    end
+  end
+  return nil
+end
+
+local function diff_toolbar_hunks(bufnr)
+  local data = mini_diff_data_for_buffer(bufnr)
+  if not data or data.overlay ~= true or type(data.hunks) ~= "table" or #data.hunks == 0 then
+    return nil, 0
+  end
+  return data, data.summary and tonumber(data.summary.n_ranges) or #data.hunks
+end
+
+local function diff_toolbar_line(text, width)
+  text = tostring(text or "")
+  local display_width = vim.fn.strdisplaywidth(text)
+  if display_width > width then
+    -- Avoid cutting a multi-byte glyph in the middle.  The labels are short,
+    -- so this branch is mainly for very narrow editor windows.
+    while display_width > width and vim.fn.strchars(text) > 0 do
+      text = vim.fn.strcharpart(text, 0, vim.fn.strchars(text) - 1)
+      display_width = vim.fn.strdisplaywidth(text)
+    end
+  end
+  return text .. string.rep(" ", math.max(0, width - display_width))
+end
+
+local function diff_toolbar_schedule_action(action)
+  if type(action) ~= "function" then
+    return
+  end
+  vim.schedule(function()
+    local ok, err = pcall(action)
+    if not ok then
+      vim.notify("Diff aracı çalıştırılamadı: " .. tostring(err), vim.log.levels.WARN)
+    end
+  end)
+end
+
+local function diff_toolbar_mouse_pos()
+  local ok, pos = pcall(vim.fn.getmousepos)
+  return ok and type(pos) == "table" and pos or {}
+end
+
+local function diff_toolbar_mouse_press()
+  if not diff_toolbar_win or not vim.api.nvim_win_is_valid(diff_toolbar_win) then
+    return
+  end
+  local pos = diff_toolbar_mouse_pos()
+  local cfg = vim.api.nvim_win_get_config(diff_toolbar_win)
+  diff_toolbar_drag = {
+    screenrow = tonumber(pos.screenrow) or 0,
+    screencol = tonumber(pos.screencol) or 0,
+    row = tonumber(cfg.row) or 0,
+    col = tonumber(cfg.col) or 0,
+    moved = false,
+  }
+end
+
+local function diff_toolbar_mouse_drag()
+  if not diff_toolbar_drag or not diff_toolbar_win or not vim.api.nvim_win_is_valid(diff_toolbar_win) then
+    return
+  end
+  local pos = diff_toolbar_mouse_pos()
+  local delta_row = (tonumber(pos.screenrow) or 0) - diff_toolbar_drag.screenrow
+  local delta_col = (tonumber(pos.screencol) or 0) - diff_toolbar_drag.screencol
+  if math.abs(delta_row) > 0 or math.abs(delta_col) > 0 then
+    diff_toolbar_drag.moved = true
+  end
+
+  local target_win = diff_toolbar_target_window(diff_toolbar_target_buf)
+  local max_row, max_col = math.huge, math.huge
+  if target_win and vim.api.nvim_win_is_valid(target_win) then
+    max_row = math.max(0, vim.api.nvim_win_get_height(target_win) - 2)
+    max_col = math.max(0, vim.api.nvim_win_get_width(target_win) - vim.api.nvim_win_get_width(diff_toolbar_win))
+  end
+  local cfg = vim.api.nvim_win_get_config(diff_toolbar_win)
+  cfg.row = math.max(0, math.min(max_row, diff_toolbar_drag.row + delta_row))
+  cfg.col = math.max(0, math.min(max_col, diff_toolbar_drag.col + delta_col))
+  pcall(vim.api.nvim_win_set_config, diff_toolbar_win, cfg)
+end
+
+local function diff_toolbar_mouse_release()
+  if not diff_toolbar_win or not vim.api.nvim_win_is_valid(diff_toolbar_win) then
+    diff_toolbar_drag = nil
+    return
+  end
+  local drag = diff_toolbar_drag
+  diff_toolbar_drag = nil
+  if drag and drag.moved then
+    return
+  end
+
+  local pos = diff_toolbar_mouse_pos()
+  local row = tonumber(pos.winrow) or 1
+  local col = tonumber(pos.wincol) or 1
+  local width = vim.api.nvim_win_get_width(diff_toolbar_win)
+  local target_buf = diff_toolbar_target_buf
+  if row < 2 then
+    if col >= width - 8 then
+      diff_toolbar_schedule_action(close_diff_toolbar)
+    end
+    return
+  end
+  -- The second row has three forgiving click zones, so users do not need to
+  -- hit a single glyph precisely: previous, next, and accept-all.
+  if col <= 10 then
+    diff_toolbar_schedule_action(function() goto_codex_hunk("prev", target_buf) end)
+  elseif col <= 24 then
+    diff_toolbar_schedule_action(function() goto_codex_hunk("next", target_buf) end)
+  else
+    diff_toolbar_schedule_action(function() accept_all_codex_hunks(target_buf) end)
+  end
+end
+
+local function install_diff_toolbar_mappings(bufnr)
+  local opts = { buffer = bufnr, silent = true, nowait = true, noremap = true }
+  vim.keymap.set("n", "<Esc>", close_diff_toolbar, opts)
+  vim.keymap.set("n", "q", close_diff_toolbar, opts)
+  vim.keymap.set("n", "x", close_diff_toolbar, opts)
+  vim.keymap.set("n", "<LeftMouse>", diff_toolbar_mouse_press, opts)
+  vim.keymap.set("n", "<LeftDrag>", diff_toolbar_mouse_drag, opts)
+  vim.keymap.set("n", "<LeftRelease>", diff_toolbar_mouse_release, opts)
+end
+
+local function update_diff_toolbar(bufnr)
+  bufnr = tonumber(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    if diff_toolbar_win then
+      close_diff_toolbar()
+    end
+    return
+  end
+
+  local _, ranges = diff_toolbar_hunks(bufnr)
+  local target_win = diff_toolbar_target_window(bufnr)
+  if ranges <= 0 or not target_win then
+    if diff_toolbar_target_buf == bufnr or (diff_toolbar_win and not vim.api.nvim_win_is_valid(diff_toolbar_win)) then
+      close_diff_toolbar()
+    end
+    return
+  end
+
+  local current_win = vim.api.nvim_get_current_win()
+  if diff_toolbar_win and vim.api.nvim_win_is_valid(diff_toolbar_win)
+      and diff_toolbar_target_buf == bufnr then
+    local width = vim.api.nvim_win_get_width(diff_toolbar_win)
+    local title = string.format(" CODEX DIFF · %d değişiklik", ranges)
+    local actions = " [↑] önceki   [↓] sonraki   [✓ KABUL] tümü"
+    vim.bo[diff_toolbar_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(diff_toolbar_buf, 0, -1, false, {
+      diff_toolbar_line(title .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(title) - 4)) .. " [X]", width),
+      diff_toolbar_line(actions, width),
+    })
+    vim.bo[diff_toolbar_buf].modifiable = false
+    return
+  end
+
+  if diff_toolbar_win then
+    close_diff_toolbar()
+  end
+
+  local target_width = vim.api.nvim_win_get_width(target_win)
+  local title = string.format(" CODEX DIFF · %d değişiklik", ranges)
+  local actions = " [↑] önceki   [↓] sonraki   [✓ KABUL] tümü"
+  local width = math.min(62, math.max(28, target_width - 2))
+  width = math.max(width, vim.fn.strdisplaywidth(actions) + 2)
+  width = math.min(width, math.max(1, target_width))
+
+  diff_toolbar_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[diff_toolbar_buf].buftype = "nofile"
+  vim.bo[diff_toolbar_buf].bufhidden = "wipe"
+  vim.bo[diff_toolbar_buf].swapfile = false
+  vim.bo[diff_toolbar_buf].modifiable = true
+  vim.bo[diff_toolbar_buf].filetype = "vibevim-diff-toolbar"
+  vim.api.nvim_buf_set_lines(diff_toolbar_buf, 0, -1, false, {
+    diff_toolbar_line(title .. " [X]", width),
+    diff_toolbar_line(actions, width),
+  })
+  vim.bo[diff_toolbar_buf].modifiable = false
+
+  local row = math.min(2, math.max(0, vim.api.nvim_win_get_height(target_win) - 3))
+  local col = math.max(0, math.floor((target_width - width) / 2))
+  local ok, winid = pcall(vim.api.nvim_open_win, diff_toolbar_buf, false, {
+    relative = "win",
+    win = target_win,
+    row = row,
+    col = col,
+    width = width,
+    height = 2,
+    style = "minimal",
+    border = "rounded",
+    focusable = true,
+    zindex = 80,
+    title = " Diff araçları ",
+    title_pos = "center",
+  })
+  if not ok or not winid then
+    close_diff_toolbar()
+    return
+  end
+  diff_toolbar_win = winid
+  diff_toolbar_target_buf = bufnr
+  vim.wo[winid].winhl = "Normal:VibeVimDiffToolbar,FloatBorder:VibeVimDiffToolbarBorder,CursorLine:VibeVimDiffToolbar"
+  vim.wo[winid].cursorline = false
+  vim.wo[winid].wrap = false
+  vim.wo[winid].winblend = 0
+  install_diff_toolbar_mappings(diff_toolbar_buf)
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(winid),
+    once = true,
+    callback = function()
+      if diff_toolbar_win == winid then
+        diff_toolbar_win = nil
+        diff_toolbar_target_buf = nil
+        diff_toolbar_drag = nil
+      end
+    end,
+  })
+  -- `enter=false` should preserve focus by itself; this fallback also covers
+  -- older Neovim builds that briefly focus a newly-created float.
+  if vim.api.nvim_win_is_valid(current_win) and vim.api.nvim_get_current_win() ~= current_win then
+    pcall(vim.api.nvim_set_current_win, current_win)
+  end
+end
+
+schedule_diff_toolbar_refresh = function(bufnr)
+  bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
+  diff_toolbar_pending_buf = bufnr
+  if diff_toolbar_refresh_pending then
+    return
+  end
+  diff_toolbar_refresh_pending = true
+  vim.defer_fn(function()
+    diff_toolbar_refresh_pending = false
+    local pending = diff_toolbar_pending_buf
+    diff_toolbar_pending_buf = nil
+    update_diff_toolbar(pending)
+  end, 40)
 end
 
 install_codex_diff_navigation = function(bufnr)
@@ -2168,7 +2542,7 @@ install_codex_diff_navigation = function(bufnr)
   end, { buffer = bufnr, silent = true, nowait = true, desc = "Önceki Codex değişikliği" })
   vim.keymap.set("n", "<leader>da", function()
     accept_codex_hunk(bufnr)
-  end, { buffer = bufnr, silent = true, nowait = true, desc = "Bu Codex değişikliğini kabul et" })
+  end, { buffer = bufnr, silent = true, nowait = true, desc = "Bu dosyadaki tüm Codex değişikliklerini kabul et" })
 end
 
 _G.NvimDiffNavigateClick = function(minwid, clicks)
@@ -2200,15 +2574,34 @@ end
 
 vim.api.nvim_create_user_command("CodexDiffAcceptHunk", function()
   accept_codex_hunk(vim.api.nvim_get_current_buf())
-end, { desc = "İmleçteki Codex değişikliğini kabul et" })
+end, { desc = "Dosyadaki tüm Codex değişikliklerini kabul et" })
+vim.api.nvim_create_user_command("CodexDiffAcceptAll", function()
+  accept_all_codex_hunks(vim.api.nvim_get_current_buf())
+end, { desc = "Dosyadaki tüm Codex değişikliklerini kabul et" })
 
 vim.api.nvim_create_autocmd("User", {
   group = vim.api.nvim_create_augroup("PersonalNvimDiffNavigation", { clear = true }),
   pattern = "MiniDiffUpdated",
-  callback = function()
+  callback = function(event)
     vim.schedule(function()
       pcall(vim.cmd, "redrawtabline")
+      if schedule_diff_toolbar_refresh then
+        schedule_diff_toolbar_refresh(event and event.buf or vim.api.nvim_get_current_buf())
+      end
     end)
+  end,
+})
+
+-- Switching file tabs does not always emit MiniDiffUpdated (the diff cache is
+-- already warm), so refresh the editor-local toolbar on focus changes too.
+-- This keeps a toolbar for the previously viewed file from lingering over the
+-- newly selected tab.
+vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
+  group = vim.api.nvim_create_augroup("PersonalNvimDiffToolbar", { clear = true }),
+  callback = function(event)
+    if schedule_diff_toolbar_refresh then
+      schedule_diff_toolbar_refresh(event.buf)
+    end
   end,
 })
 
@@ -2221,6 +2614,9 @@ local function close_codex_inline_diff()
     if data and data.overlay and type(mini_diff.toggle_overlay) == "function" then
       pcall(mini_diff.toggle_overlay, bufnr)
       vim.cmd("redraw!")
+      if schedule_diff_toolbar_refresh then
+        schedule_diff_toolbar_refresh(bufnr)
+      end
       return
     end
   end
@@ -3639,7 +4035,7 @@ local function diff_navigation_bar(bufnr)
     "  ",
     string.format("%%9201@v:lua.NvimDiffNavigateClick@ [↑] %%T"),
     string.format("%%9202@v:lua.NvimDiffNavigateClick@ [↓] %%T"),
-    string.format("%%9203@v:lua.NvimDiffNavigateClick@ [✓ kabul] %%T"),
+    string.format("%%9203@v:lua.NvimDiffNavigateClick@ [✓ tümünü kabul] %%T"),
     label,
   })
 end
@@ -3664,6 +4060,9 @@ local function control_winbar()
   local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) or vim.api.nvim_get_current_buf()
   local ft = vim.bo[buf].filetype
+  if ft == "vibevim-diff-toolbar" then
+    return ""
+  end
   if vim.b[buf].personal_terminal_id then
     return terminal_session_bar()
   end
@@ -4249,6 +4648,11 @@ local function apply_modal_close_affordance(winid)
   local cfg = vim.api.nvim_win_get_config(winid)
   local buf = vim.api.nvim_win_get_buf(winid)
   local filetype = vim.bo[buf].filetype
+  -- The inline diff toolbar owns its own two-line title/actions and [X]
+  -- control; the generic modal winbar would add a second, confusing close bar.
+  if filetype == "vibevim-diff-toolbar" then
+    return
+  end
   -- Codex's own terminal/tab strip already owns a richer [X] control. Do not
   -- replace it with the generic modal bar when Snacks renders an agent as a
   -- floating terminal.

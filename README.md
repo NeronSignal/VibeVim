@@ -11,7 +11,7 @@ The screenshot shows the intended three-pane workflow: project files on the left
 ## Highlights
 
 - **Codex in the editor**: embedded Codex terminal, multiple Codex agent tabs, YOLO-aware diff approval, automatic scroll-to-input, and file changes opened in the centre editor.
-- **Reliable inline diffs**: the current file remains the only centre buffer; additions are green and removed/reference text is red regardless of the selected theme. Git index/HEAD snapshots are used as the comparison baseline, including untracked files.
+- **Reliable inline diffs**: the current file remains the only centre buffer; additions are green and removed/reference text is red regardless of the selected theme. Git index/HEAD snapshots are used as the comparison baseline, including untracked files. A draggable editor-local toolbar provides previous/next navigation and one-click accept-all (including newly-created files).
 - **Mouse-friendly file workflow**: NvimTree, clickable header/menu, buffer tabs with a visible x, middle-click closing, and safe routing of file-tab clicks away from terminal panels.
 - **Independent terminals**: create separate Shell, Codex, OpenCode, Claude Code, or custom command sessions in one shared right-hand terminal panel; switching tabs never adds another split or replaces the editor. A normal PTY exit is handled quietly.
 - **Rich previews**: Glimpse previews images, video, archives, SQLite, documents, diagrams, and other formats when the terminal/protocol and optional tools are available.
@@ -67,6 +67,7 @@ Keep API keys in your shell/keychain; never commit them to init.lua or a dotfile
 | :TerminalNew | Choose Shell, Codex, OpenCode, Claude, or a custom terminal command |
 | :ThemeSelect | Choose a dark or light theme |
 | :CodexDiff [path] | Show one file's inline diff in the centre editor |
+| Floating diff toolbar | Drag its title bar; use ↑/↓ to move between changes, ✓ KABUL to accept every hunk in the file, or X to hide the toolbar |
 
 The complete mouse and keymap reference is available from F1 → ? or :NvimShortcuts.
 
@@ -96,7 +97,7 @@ Yapay zekâ destekli kodlama için fare kullanımını kolaylaştıran, masaüst
 Shell, Codex, OpenCode ve Claude oturumları sağdaki tek terminal panelinde sekme
 olarak tutulur; yeni terminal açmak ek bir pencere/split oluşturmaz.
 
-Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
+Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. Editör üzerinde taşınabilir diff aracı ↑/↓ ile değişiklikler arasında dolaşır; ✓ Kabul dosyadaki tüm hunks'ları (yeni dosya dahil) tek seferde kabul eder. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
 
 Varsayılan tema Flexoki Dark'tır; header'daki tema düğmesinden veya :ThemeSelect komutundan diğer koyu/açık temalara geçebilirsiniz.
 Üretilmiş `*.map`, `*.tsbuildinfo`, minified/bundle çıktıları, lock/cache/debug-log
