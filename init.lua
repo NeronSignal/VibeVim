@@ -741,6 +741,7 @@ apply_diff_highlights()
 -- than as source code: line numbers and the sign column only add noise, while
 -- level/timestamp highlighting makes a long run scannable at a glance.
 local console_log_match_ids = {}
+local console_log_states = {}
 
 local function is_console_log_path(path)
   if type(path) ~= "string" or path == "" then
@@ -749,6 +750,112 @@ local function is_console_log_path(path)
   local basename = vim.fn.fnamemodify(path, ":t")
   return basename:match("^console%-.+%.log$") ~= nil
 end
+
+local function console_log_is_noise(line)
+  if type(line) ~= "string" then
+    return false
+  end
+  local lower = line:lower()
+  -- These are browser/framework heartbeats rather than application output.
+  -- Keep all errors and warnings (including HMR/WebSocket failures) visible.
+  return lower:find("download the react devtools", 1, true) ~= nil
+    or lower:find("[log] [hmr] connected", 1, true) ~= nil
+    or lower:find("[log] [fast refresh] rebuilding", 1, true) ~= nil
+    or lower:find("[log] [fast refresh] done", 1, true) ~= nil
+end
+
+local function filter_console_log_buffer(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  if not vim.b[bufnr].personal_console_log then
+    return
+  end
+
+  local state = console_log_states[bufnr]
+  if state then
+    return
+  end
+
+  local original = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local filtered = {}
+  for _, line in ipairs(original) do
+    if not console_log_is_noise(line) then
+      filtered[#filtered + 1] = line
+    end
+  end
+
+  state = {
+    original = vim.deepcopy(original),
+    filtered = vim.deepcopy(filtered),
+    showing_all = false,
+  }
+  console_log_states[bufnr] = state
+  vim.b[bufnr].personal_console_log_showing_all = false
+
+  if #filtered == #original then
+    return
+  end
+  if #filtered == 0 then
+    filtered = { "(Bu projeye ait console kaydı bulunamadı.)" }
+    state.filtered = vim.deepcopy(filtered)
+  end
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, filtered)
+  vim.bo[bufnr].modified = false
+end
+
+local function restore_console_log_buffer(bufnr, show_all)
+  local state = console_log_states[bufnr]
+  if not state or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  local lines = show_all and state.original or state.filtered
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.bo[bufnr].modified = false
+  state.showing_all = show_all == true
+  vim.b[bufnr].personal_console_log_showing_all = state.showing_all
+  return true
+end
+
+local function toggle_console_log_filter()
+  local bufnr = vim.api.nvim_get_current_buf()
+  if not vim.b[bufnr].personal_console_log then
+    vim.notify("Bu buffer bir console-*.log dosyası değil", vim.log.levels.INFO)
+    return
+  end
+  local state = console_log_states[bufnr]
+  if not state then
+    filter_console_log_buffer(bufnr)
+    state = console_log_states[bufnr]
+  end
+  if state then
+    restore_console_log_buffer(bufnr, not state.showing_all)
+    vim.cmd("redraw")
+  end
+end
+
+local function show_project_console_log()
+  local bufnr = vim.api.nvim_get_current_buf()
+  if vim.b[bufnr].personal_console_log then
+    restore_console_log_buffer(bufnr, false)
+  end
+end
+
+vim.api.nvim_create_user_command("ConsoleLogToggle", toggle_console_log_filter, {
+  desc = "Console logunda proje/gürültü filtresini aç-kapat",
+})
+vim.api.nvim_create_user_command("ConsoleLogAll", function()
+  local bufnr = vim.api.nvim_get_current_buf()
+  if vim.b[bufnr].personal_console_log then
+    filter_console_log_buffer(bufnr)
+    restore_console_log_buffer(bufnr, true)
+  end
+end, { desc = "Console logunun ham tüm satırlarını göster" })
+vim.api.nvim_create_user_command("ConsoleLogProject", show_project_console_log, {
+  desc = "Console logunda yalnızca proje kayıtlarını göster",
+})
 
 local function apply_console_log_highlights()
   vim.api.nvim_set_hl(0, "ConsoleLogTimestamp", { fg = "#8b949e" })
@@ -818,6 +925,7 @@ local function configure_console_log_buffer(bufnr)
   vim.bo[bufnr].filetype = "consolelog"
   vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].undofile = false
+  filter_console_log_buffer(bufnr)
   for _, winid in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == bufnr then
       configure_console_log_window(winid)
@@ -831,8 +939,26 @@ local console_log_group = vim.api.nvim_create_augroup("PersonalNvimConsoleLogVie
 vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "BufEnter", "BufWinEnter", "WinEnter" }, {
   group = console_log_group,
   callback = function(event)
+    if event.event == "BufReadPost" or event.event == "BufNewFile" then
+      console_log_states[event.buf] = nil
+    end
     configure_console_log_buffer(event.buf)
     configure_console_log_window(vim.api.nvim_get_current_win())
+  end,
+})
+vim.api.nvim_create_autocmd("FileChangedShellPost", {
+  group = console_log_group,
+  callback = function(event)
+    if vim.b[event.buf].personal_console_log then
+      console_log_states[event.buf] = nil
+      configure_console_log_buffer(event.buf)
+    end
+  end,
+})
+vim.api.nvim_create_autocmd("BufWipeout", {
+  group = console_log_group,
+  callback = function(event)
+    console_log_states[event.buf] = nil
   end,
 })
 vim.api.nvim_create_autocmd("WinClosed", {
