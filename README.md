@@ -44,7 +44,7 @@ lazy.nvim bootstraps itself on the first launch and installs the declared plugin
 
 ### Install with npm
 
-The repository includes a zero-dependency installer CLI. After the `vibevim` package is published, install it globally and activate the Neovim configuration:
+The repository includes a zero-dependency installer CLI. Install it globally and activate the Neovim configuration:
 
 ~~~bash
 npm install --global vibevim
@@ -52,7 +52,7 @@ vibevim install
 nvim
 ~~~
 
-Until the npm release is published, the same CLI can be installed directly from GitHub:
+The same CLI can also be installed directly from GitHub:
 
 ~~~bash
 npm install --global github:NeronSignal/VibeVim
@@ -60,6 +60,18 @@ vibevim install
 ~~~
 
 `vibevim install` keeps an existing `~/.config/nvim` (or the platform equivalent) as a timestamped backup. Use `vibevim install --yes` for scripted setup and `vibevim doctor` to check Neovim/Git and the active config.
+
+### Automatic npm releases
+
+Every push to `main` that changes the packaged configuration runs
+`.github/workflows/publish-npm.yml`. The workflow publishes the package with
+provenance. npm versions are immutable, so if the version in `package.json`
+already exists on npm, the workflow advances the patch version, publishes it,
+and commits that version back to `main` with `[skip ci]`.
+
+For the workflow to publish, add an npm automation or granular publish token as
+the repository secret `NPM_TOKEN` in **Settings → Secrets and variables →
+Actions**. The secret value is never stored in this repository.
 
 ### Codex credentials and provider settings
 
@@ -127,7 +139,7 @@ Kurulum için mevcut ~/.config/nvim klasörünü yedekleyip depoyu klonlayın. E
 
 ### npm ile global kurulum
 
-Paket npm’de yayınlandığında arkadaşınız şu komutlarla kurabilir:
+Paket npm’de yayınlandı; arkadaşınız şu komutlarla kurabilir:
 
 ~~~bash
 npm install --global vibevim
@@ -135,6 +147,17 @@ vibevim install
 nvim
 ~~~
 
-Paket yayınlanmadan GitHub sürümünü kullanmak için `npm install --global github:NeronSignal/VibeVim` komutu da çalışır. `vibevim install` mevcut Neovim ayarlarını tarih damgalı bir yedeğe taşır; otomasyon için `--yes`, ortam kontrolü için `vibevim doctor` kullanılabilir.
+GitHub’daki güncel sürümü kullanmak için `npm install --global github:NeronSignal/VibeVim` komutu da çalışır. `vibevim install` mevcut Neovim ayarlarını tarih damgalı bir yedeğe taşır; otomasyon için `--yes`, ortam kontrolü için `vibevim doctor` kullanılabilir.
+
+### GitHub → npm otomatik yayın
+
+`main` dalına paket içeriğini etkileyen her push, `.github/workflows/publish-npm.yml`
+iş akışını çalıştırır. `package.json` sürümü npm’de zaten varsa iş akışı patch
+sürümünü otomatik artırır, paketi provenance ile yayınlar ve yeni sürümü
+`[skip ci]` commit’iyle GitHub’a geri yazar.
+
+Yayın yetkisi için GitHub deposunda **Settings → Secrets and variables →
+Actions** bölümüne `NPM_TOKEN` adlı npm automation/granular publish token
+secret’ı ekleyin. Token repoya yazılmaz.
 
 Katkı göndermek için bir branch açın, temiz bir test profiliyle Neovim'i başlatın ve işletim sistemi/terminal/Neovim sürümünü açıklayın. Gizli anahtarları, özel endpoint'leri ve proje loglarını commit etmeyin.

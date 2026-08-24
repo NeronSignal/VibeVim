@@ -33,6 +33,14 @@ vim.opt.cursorline = true
 vim.opt.cursorlineopt = "number,screenline"
 vim.opt.splitright = true
 vim.opt.splitbelow = true
+-- Keep edited buffers switchable while file tabs are clicked.  The explicit
+-- close path below still asks before discarding changes; 'hidden' only avoids
+-- Neovim's E37 guard when moving to another tab.  'screen' keeps the cursor
+-- and visible rows stable when the tree/terminal layout changes, an approach
+-- also used by mature LazyVim-style configurations.
+vim.opt.hidden = true
+vim.opt.splitkeep = "screen"
+vim.opt.numberwidth = 4
 vim.opt.ignorecase = true
 vim.opt.smartcase = true
 vim.opt.expandtab = true
@@ -1002,6 +1010,156 @@ vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "FileType" 
     focus_codecompanion_input(vim.api.nvim_get_current_win())
   end,
 })
+
+-- A desktop-style click should leave the terminal prompt and put the centre
+-- editor in a state where typing works immediately.  Neovim intentionally
+-- opens normal file buffers in Normal mode; that is correct for Vim users but
+-- confusing in a mouse-first three-pane layout because a click followed by a
+-- letter is interpreted as a Normal-mode command instead of text input.  Keep
+-- this opt-in per normal editor buffer so NvimTree, terminals, diff panes and
+-- read-only log surfaces retain their native mappings.
+local editor_mouse_focus_group = vim.api.nvim_create_augroup("PersonalNvimEditorMouseFocus", { clear = true })
+local editor_non_editable_filetypes = {
+  NvimTree = true,
+  DiffviewFiles = true,
+  DiffviewFilePanel = true,
+  DiffviewFileHistory = true,
+  Trouble = true,
+  lazy = true,
+  qf = true,
+  notify = true,
+  codecompanion = true,
+  consolelog = true,
+  ["vibevim-diff-toolbar"] = true,
+}
+
+local function editor_mouse_target(bufnr, winid)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  if vim.bo[bufnr].buftype ~= "" or vim.b[bufnr].personal_console_log == true then
+    return false
+  end
+  if vim.b[bufnr].personal_large_file == true then
+    return false
+  end
+  if editor_non_editable_filetypes[vim.bo[bufnr].filetype] then
+    return false
+  end
+  if type(winid) == "number" and vim.api.nvim_win_is_valid(winid) and vim.wo[winid].diff then
+    return false
+  end
+  return true
+end
+
+local function restore_editor_editability(bufnr, winid)
+  if not editor_mouse_target(bufnr, winid) then
+    return false
+  end
+  -- FileChangedRO can leave a previously loaded buffer read-only after an
+  -- external Codex write.  Clearing both flags restores the normal editing
+  -- contract; a later :write still reports a real filesystem permission error
+  -- when the path itself is not writable.
+  vim.bo[bufnr].readonly = false
+  vim.bo[bufnr].modifiable = true
+  return true
+end
+
+local function editor_mouse_insert()
+  local ok, pos = pcall(vim.fn.getmousepos)
+  if not ok or type(pos) ~= "table" then
+    return
+  end
+  local target_win = tonumber(pos.winid)
+  if not target_win or not vim.api.nvim_win_is_valid(target_win) then
+    return
+  end
+  local target_buf = vim.api.nvim_win_get_buf(target_win)
+  if not editor_mouse_target(target_buf, target_win) then
+    return
+  end
+
+  -- A mouse mapping replaces Neovim's default cursor placement, so apply the
+  -- click location ourselves before entering Insert mode.  The column is
+  -- byte-based, matching nvim_win_set_cursor's API.
+  local line = tonumber(pos.line)
+  local column = tonumber(pos.column)
+  if line and line >= 1 and line <= vim.api.nvim_buf_line_count(target_buf) then
+    local text = vim.api.nvim_buf_get_lines(target_buf, line - 1, line, false)[1] or ""
+    local max_column = #text
+    local cursor_column = math.max(0, math.min(max_column, (column or 1) - 1))
+    pcall(vim.api.nvim_win_set_cursor, target_win, { line, cursor_column })
+  end
+  restore_editor_editability(target_buf, target_win)
+  pcall(vim.api.nvim_set_current_win, target_win)
+
+  -- Enter Insert mode immediately so a character typed right after the click
+  -- cannot land in Normal mode.  The scheduled retry covers frontends that
+  -- finish dispatching the mouse release after this callback returns.
+  if vim.api.nvim_get_mode().mode == "n" then
+    pcall(vim.cmd, "startinsert")
+  end
+  vim.schedule(function()
+    if not vim.api.nvim_win_is_valid(target_win)
+        or vim.api.nvim_get_current_win() ~= target_win
+        or vim.api.nvim_win_get_buf(target_win) ~= target_buf then
+      return
+    end
+    local mode = vim.api.nvim_get_mode().mode
+    if mode == "n" then
+      pcall(vim.cmd, "startinsert")
+    end
+  end)
+end
+
+local function attach_editor_mouse_focus(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  if not editor_mouse_target(bufnr, vim.fn.bufwinid(bufnr)) then
+    return
+  end
+  if vim.b[bufnr].personal_editor_mouse_focus then
+    return
+  end
+  vim.b[bufnr].personal_editor_mouse_focus = true
+  vim.keymap.set("n", "<LeftMouse>", editor_mouse_insert, {
+    buffer = bufnr,
+    silent = true,
+    nowait = true,
+    noremap = true,
+    desc = "Editöre tıklayınca yazma moduna geç",
+  })
+end
+
+vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "FileType" }, {
+  group = editor_mouse_focus_group,
+  pattern = "*",
+  callback = function(event)
+    attach_editor_mouse_focus(event.buf)
+    restore_editor_editability(event.buf, vim.api.nvim_get_current_win())
+  end,
+})
+
+-- External Codex/agent writes can trigger this event even when the buffer was
+-- already open.  Follow the same readonly recovery pattern used by mature
+-- Neovim distributions: keep the buffer editable while leaving filesystem
+-- permission failures to the actual write command.
+vim.api.nvim_create_autocmd("FileChangedRO", {
+  group = editor_mouse_focus_group,
+  callback = function(event)
+    restore_editor_editability(event.buf, vim.fn.bufwinid(event.buf))
+  end,
+})
+
+vim.api.nvim_create_user_command("VibeVimEdit", function()
+  local bufnr = vim.api.nvim_get_current_buf()
+  if restore_editor_editability(bufnr, vim.api.nvim_get_current_win()) then
+    vim.notify("Editör yazma modu etkin", vim.log.levels.INFO)
+  else
+    vim.notify("Bu panel düzenlenebilir bir kaynak dosyası değil", vim.log.levels.INFO)
+  end
+end, { desc = "Geçerli kaynak buffer'ını yeniden düzenlenebilir yap" })
 
 local function color_from_highlight(name, fallback)
   local ok, value = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })

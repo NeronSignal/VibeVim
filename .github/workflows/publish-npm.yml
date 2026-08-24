@@ -1,0 +1,98 @@
+name: Publish VibeVim to npm
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "init.lua"
+      - "lazy-lock.json"
+      - "lua/**"
+      - "assets/**"
+      - "bin/**"
+      - "README.md"
+      - "LICENSE"
+      - "TODO.md"
+      - "package.json"
+      - ".github/workflows/publish-npm.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: vibevim-npm-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Prepare package version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(node -p 'require("./package.json").name')"
+          package_version="$(node -p 'require("./package.json").version')"
+
+          # npm versions are immutable. If a contributor pushes source changes
+          # without manually bumping package.json, advance the patch version
+          # automatically so every main-branch update can be released.
+          if npm view "${package_name}@${package_version}" version \
+              --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            npm version patch --no-git-tag-version >/dev/null
+            package_version="$(node -p 'require("./package.json").version')"
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "version=${package_version}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${package_name}@${package_version}"
+
+      - name: Require npm publish token
+        if: steps.release.outputs.version != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN GitHub Actions secret is not configured."
+            echo "Add an npm automation/granular publish token in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Validate package
+        run: |
+          npm test
+          npm pack --dry-run
+
+      - name: Publish package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Commit automatic patch bump
+        if: steps.release.outputs.bumped == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: release vibevim@${RELEASE_VERSION} [skip ci]"
+          git push

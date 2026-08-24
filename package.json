@@ -1,6 +1,6 @@
 {
   "name": "vibevim",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Mouse-friendly Neovim workbench for Codex and AI-assisted coding",
   "type": "commonjs",
   "bin": {
