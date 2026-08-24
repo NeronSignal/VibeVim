@@ -30,15 +30,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
       - name: Prepare package version
         id: release
@@ -64,17 +65,6 @@ jobs:
           echo "version=${package_version}" >> "$GITHUB_OUTPUT"
           echo "Publishing ${package_name}@${package_version}"
 
-      - name: Require npm publish token
-        if: steps.release.outputs.version != ''
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN GitHub Actions secret is not configured."
-            echo "Add an npm automation/granular publish token in Settings > Secrets and variables > Actions."
-            exit 1
-          fi
-
       - name: Validate package
         run: |
           npm test
@@ -82,6 +72,9 @@ jobs:
 
       - name: Publish package
         env:
+          # npm 11+ prefers the workflow's OIDC identity when a Trusted
+          # Publisher is configured.  NPM_TOKEN remains an optional fallback
+          # for maintainers who deliberately use a 2FA-bypass automation token.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
 

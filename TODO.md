@@ -44,6 +44,8 @@ istek önce buraya eklenir; doğrulanmadan tamamlandı olarak işaretlenmez.
       en alta dönünce takip modunu yeniden açma.
 - [x] Birden fazla diff hunk'ı için merkez sekme şeridinde Yukarı/Aşağı gezinme
       ve CodexDiffAcceptHunk/<leader>da ile hunk kabulü.
+- [x] Diff aracında açık tüm Codex sayfalarını (dosyaları) tek seferde kabul
+      etme; yeni oluşturulan dosyalar da bu kapsama dahil.
 - [x] Kabul edilen hunk'ı oturum içi yeni baseline yapıp tekrar değişene kadar
       yeşil/kırmızı göstermeme.
 - [ ] Hunk kabulü/reddinin Codex CLI, CodeCompanion ve manuel edit akışlarında

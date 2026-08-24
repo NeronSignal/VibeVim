@@ -26,7 +26,11 @@ vim.opt.mousemodel = "popup_setpos"
 vim.opt.mousescroll = "ver:5,hor:2"
 vim.opt.clipboard = "unnamedplus"
 vim.opt.updatetime = 250
-vim.opt.timeoutlen = 400
+-- Short terminal escape-sequence timeout keeps mouse clicks and function keys
+-- responsive while retaining a comfortable mapping timeout for key chords.
+vim.opt.ttimeout = true
+vim.opt.ttimeoutlen = 25
+vim.opt.timeoutlen = 280
 vim.opt.scrolloff = 6
 vim.opt.sidescrolloff = 8
 vim.opt.cursorline = true
@@ -2299,8 +2303,10 @@ local function native_codex_diff_for_buffer(bufnr)
   return nil, nil, nil
 end
 
-local function accept_all_codex_hunks(bufnr)
+local function accept_all_codex_hunks(bufnr, opts)
   bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
+  opts = type(opts) == "table" and opts or {}
+  local quiet = opts.quiet == true
   if not vim.api.nvim_buf_is_valid(bufnr) then
     return false
   end
@@ -2311,13 +2317,17 @@ local function accept_all_codex_hunks(bufnr)
     or vim.b[bufnr].codex_diff_tab_name ~= nil
     or native_state ~= nil
   if not is_codex_buffer then
-    vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    if not quiet then
+      vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    end
     return false
   end
 
   local current_lines = codex_buffer_lines(bufnr)
   if not current_lines then
-    vim.notify("Codex dosyasının içeriği okunamadı", vim.log.levels.WARN)
+    if not quiet then
+      vim.notify("Codex dosyasının içeriği okunamadı", vim.log.levels.WARN)
+    end
     return false
   end
 
@@ -2342,7 +2352,9 @@ local function accept_all_codex_hunks(bufnr)
   local differs = ref_lines and not vim.deep_equal(current_lines, ref_lines)
   local native_pending = native_state and native_state.status == "pending"
   if not has_hunks and not differs and not native_pending then
-    vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    if not quiet then
+      vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    end
     return false
   end
 
@@ -2352,10 +2364,26 @@ local function accept_all_codex_hunks(bufnr)
   remember_codex_diff_baseline(path, current_lines)
   vim.b[bufnr].codex_diff_reference_lines = vim.deepcopy(current_lines)
   mini_diff = mini_diff or ensure_mini_diff()
-  if mini_diff and type(mini_diff.set_ref_text) == "function" then
-    local ok, err = pcall(mini_diff.set_ref_text, bufnr, current_lines)
-    if not ok then
-      vim.notify("Inline diff temeli güncellenemedi: " .. tostring(err), vim.log.levels.WARN)
+  if mini_diff then
+    -- A page opened by a multi-file turn may be listed before its first
+    -- hunk calculation. Enable it lazily so accepting all pages does not
+    -- depend on which tab happened to be visible first.
+    local current_data
+    if type(mini_diff.get_buf_data) == "function" then
+      local data_ok
+      data_ok, current_data = pcall(mini_diff.get_buf_data, bufnr)
+      if not data_ok then
+        current_data = nil
+      end
+    end
+    if not current_data and type(mini_diff.enable) == "function" then
+      pcall(mini_diff.enable, bufnr)
+    end
+    if type(mini_diff.set_ref_text) == "function" then
+      local ok, err = pcall(mini_diff.set_ref_text, bufnr, current_lines)
+      if not ok and not quiet then
+        vim.notify("Inline diff temeli güncellenemedi: " .. tostring(err), vim.log.levels.WARN)
+      end
     end
   end
 
@@ -2376,7 +2404,71 @@ local function accept_all_codex_hunks(bufnr)
       schedule_diff_toolbar_refresh(bufnr)
     end
   end)
-  vim.notify("Dosyadaki tüm Codex değişiklikleri kabul edildi", vim.log.levels.INFO)
+  if not quiet then
+    vim.notify("Dosyadaki tüm Codex değişiklikleri kabul edildi", vim.log.levels.INFO)
+  end
+  return true
+end
+
+-- Collect every centre-editor buffer that was opened for a Codex/agent edit.
+-- The active native diff table is included as well because a newly-created
+-- file can be waiting for acceptance before mini.diff has produced a hunk.
+local function codex_diff_page_buffers()
+  local buffers = {}
+  local seen = {}
+  local function add(bufnr)
+    bufnr = tonumber(bufnr)
+    if bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) and not seen[bufnr] then
+      seen[bufnr] = true
+      buffers[#buffers + 1] = bufnr
+    end
+  end
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr)
+        and (vim.b[bufnr].personal_codex_diff == true
+          or vim.b[bufnr].codex_diff_tab_name ~= nil
+          or vim.b[bufnr].codex_diff_file_path ~= nil) then
+      add(bufnr)
+    end
+  end
+
+  local ok, diff = pcall(require, "codex.diff")
+  if ok and type(diff) == "table" and type(diff._get_active_diffs) == "function" then
+    local active = diff._get_active_diffs()
+    if type(active) == "table" then
+      for _, state in pairs(active) do
+        if type(state) == "table" then
+          add(state.new_buffer)
+          if type(state.old_file_path) == "string" and state.old_file_path ~= "" then
+            add(vim.fn.bufnr(vim.fn.fnamemodify(state.old_file_path, ":p")))
+          end
+        end
+      end
+    end
+  end
+  table.sort(buffers)
+  return buffers
+end
+
+local function accept_all_codex_pages()
+  local accepted = 0
+  for _, bufnr in ipairs(codex_diff_page_buffers()) do
+    if accept_all_codex_hunks(bufnr, { quiet = true }) then
+      accepted = accepted + 1
+    end
+  end
+  if accepted == 0 then
+    vim.notify("Kabul edilecek açık Codex sayfası yok", vim.log.levels.INFO)
+    return false
+  end
+  vim.schedule(function()
+    pcall(vim.cmd, "redrawtabline")
+    if schedule_diff_toolbar_refresh then
+      schedule_diff_toolbar_refresh(vim.api.nvim_get_current_buf())
+    end
+  end)
+  vim.notify(string.format("Tüm Codex sayfaları kabul edildi (%d dosya)", accepted), vim.log.levels.INFO)
   return true
 end
 
@@ -2551,14 +2643,17 @@ local function diff_toolbar_mouse_release()
     end
     return
   end
-  -- The second row has three forgiving click zones, so users do not need to
-  -- hit a single glyph precisely: previous, next, and accept-all.
+  -- The second row has forgiving click zones, so users do not need to hit a
+  -- single glyph precisely: previous, next, active-file accept-all, and
+  -- accept every open Codex page.
   if col <= 10 then
     diff_toolbar_schedule_action(function() goto_codex_hunk("prev", target_buf) end)
   elseif col <= 24 then
     diff_toolbar_schedule_action(function() goto_codex_hunk("next", target_buf) end)
-  else
+  elseif col <= 39 then
     diff_toolbar_schedule_action(function() accept_all_codex_hunks(target_buf) end)
+  else
+    diff_toolbar_schedule_action(accept_all_codex_pages)
   end
 end
 
@@ -2595,7 +2690,7 @@ local function update_diff_toolbar(bufnr)
       and diff_toolbar_target_buf == bufnr then
     local width = vim.api.nvim_win_get_width(diff_toolbar_win)
     local title = string.format(" CODEX DIFF · %d değişiklik", ranges)
-    local actions = " [↑] önceki   [↓] sonraki   [✓ KABUL] tümü"
+    local actions = " [↑] önceki   [↓] sonraki   [✓ DOSYA]   [✓ TÜM SAYFALAR]"
     vim.bo[diff_toolbar_buf].modifiable = true
     vim.api.nvim_buf_set_lines(diff_toolbar_buf, 0, -1, false, {
       diff_toolbar_line(title .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(title) - 4)) .. " [X]", width),
@@ -2611,7 +2706,7 @@ local function update_diff_toolbar(bufnr)
 
   local target_width = vim.api.nvim_win_get_width(target_win)
   local title = string.format(" CODEX DIFF · %d değişiklik", ranges)
-  local actions = " [↑] önceki   [↓] sonraki   [✓ KABUL] tümü"
+  local actions = " [↑] önceki   [↓] sonraki   [✓ DOSYA]   [✓ TÜM SAYFALAR]"
   local width = math.min(62, math.max(28, target_width - 2))
   width = math.max(width, vim.fn.strdisplaywidth(actions) + 2)
   width = math.min(width, math.max(1, target_width))
@@ -2736,6 +2831,9 @@ end, { desc = "Dosyadaki tüm Codex değişikliklerini kabul et" })
 vim.api.nvim_create_user_command("CodexDiffAcceptAll", function()
   accept_all_codex_hunks(vim.api.nvim_get_current_buf())
 end, { desc = "Dosyadaki tüm Codex değişikliklerini kabul et" })
+vim.api.nvim_create_user_command("CodexDiffAcceptAllPages", function()
+  accept_all_codex_pages()
+end, { desc = "Açık tüm Codex diff sayfalarını kabul et" })
 
 vim.api.nvim_create_autocmd("User", {
   group = vim.api.nvim_create_augroup("PersonalNvimDiffNavigation", { clear = true }),
@@ -2860,6 +2958,33 @@ open_edited_files_in_center = function(paths, opts)
     end
     pcall(vim.api.nvim_win_set_buf, editor_win, opened[1])
     vim.cmd("redrawtabline")
+  end
+
+  -- A single Codex turn can edit several files.  Mark every reported file as
+  -- a review page (not only the first file shown in the centre), and attach
+  -- the same deterministic Git/index baseline used by :CodexDiff.  This lets
+  -- the toolbar's “TÜM SAYFALAR” action accept the whole turn in one click.
+  if opts.prepare_codex_diff_pages == true then
+    for index, bufnr in ipairs(opened) do
+      local path = vim.api.nvim_buf_get_name(bufnr)
+      if path == "" then
+        path = vim.b[bufnr].codex_diff_file_path
+      end
+      if type(path) == "string" and path ~= "" then
+        vim.b[bufnr].personal_codex_diff = true
+        vim.b[bufnr].codex_diff_file_path = path
+        local reference_lines = git_reference_lines_for_path(path)
+        if reference_lines ~= nil then
+          vim.b[bufnr].codex_diff_reference_lines = vim.deepcopy(reference_lines)
+          enable_codex_inline_overlay(bufnr, reference_lines)
+        end
+      end
+      -- Keep the first reported file visible; the other pages remain listed
+      -- in bufferline for direct review and the all-pages accept operation.
+      if index == 1 and vim.api.nvim_win_is_valid(editor_win) then
+        pcall(vim.api.nvim_win_set_buf, editor_win, bufnr)
+      end
+    end
   end
 
   if preserve_focus and vim.api.nvim_win_is_valid(original_win) then
@@ -3448,8 +3573,24 @@ terminal_session_bar = function()
   return table.concat(parts) .. "%=%#TabLineSel#  "
 end
 
-_G.TerminalSessionClick = function(minwid, _, button)
+local terminal_session_click_state
+_G.TerminalSessionClick = function(minwid, clicks, button)
   local id = tonumber(minwid) or 0
+  local now = (vim.uv or vim.loop).hrtime() / 1e6
+  local click_button = button or "l"
+  local click_count = tonumber(clicks) or 1
+  local previous = terminal_session_click_state
+  if type(previous) == "table"
+      and previous.id == id
+      and previous.button == click_button
+      and previous.clicks == click_count
+      and now - (tonumber(previous.at) or 0) < 220 then
+    return
+  end
+  terminal_session_click_state = { id = id, button = click_button, clicks = click_count, at = now }
+  if click_count > 1 then
+    return
+  end
   vim.schedule(function()
     if id == 8990 then
       new_terminal_session()
@@ -3734,8 +3875,24 @@ codex_agent_bar = function()
   return table.concat(parts) .. "%=%#TabLineSel#  "
 end
 
-_G.CodexAgentClick = function(minwid, _, button)
+local codex_agent_click_state
+_G.CodexAgentClick = function(minwid, clicks, button)
   local id = tonumber(minwid) or 0
+  local now = (vim.uv or vim.loop).hrtime() / 1e6
+  local click_button = button or "l"
+  local click_count = tonumber(clicks) or 1
+  local previous = codex_agent_click_state
+  if type(previous) == "table"
+      and previous.id == id
+      and previous.button == click_button
+      and previous.clicks == click_count
+      and now - (tonumber(previous.at) or 0) < 220 then
+    return
+  end
+  codex_agent_click_state = { id = id, button = click_button, clicks = click_count, at = now }
+  if click_count > 1 then
+    return
+  end
   vim.schedule(function()
     if button == "r" then
       close_codex_agent(codex_agent_current_id(vim.api.nvim_get_current_win()) or 0)
@@ -3834,6 +3991,7 @@ local shortcut_groups = {
       { "<leader>cm", "Codex terminalini büyüt/küçült" },
       { "<leader>cs", "Görsel seçimi Codex'e gönder" },
       { "<leader>ca / <leader>cx", "Diff kabul / reddet" },
+      { "<leader>dA / :CodexDiffAcceptAllPages", "Açık tüm Codex diff sayfalarını kabul et" },
       { "<leader>ac", "CodeCompanion sohbeti" },
       { "<leader>ae", "Seçili kodu CodeCompanion ile düzenle" },
       { "<leader>ar", "CodeCompanion code review" },
@@ -4477,7 +4635,10 @@ vim.api.nvim_create_autocmd("User", {
       local preserve_focus = codex_terminal_buffer(focused_buf)
         or codecompanion_input_window(focused_win)
         or focused_mode:match("^[it]") ~= nil
-      local preview_opts = { preserve_focus = preserve_focus }
+      local preview_opts = {
+        preserve_focus = preserve_focus,
+        prepare_codex_diff_pages = true,
+      }
       open_edited_files_in_center(ordered_paths, preview_opts)
       open_codex_diff(first_edited_path, preview_opts)
     end, 350)
@@ -4556,7 +4717,7 @@ local function close_codex_edit_watch()
   codex_edit_watch.pending = {}
 end
 
-local function ignored_codex_edit_path(root, path)
+local function ignored_codex_edit_path(root, path, allow_missing)
   if type(path) ~= "string" or path == "" then
     return true
   end
@@ -4583,7 +4744,10 @@ local function ignored_codex_edit_path(root, path)
   if relative:match("/%.sw[po]$") or relative:match("~$") or relative:match("%.tmp$") then
     return true
   end
-  return vim.fn.filereadable(path) ~= 1
+  -- Atomic-save tools may emit the fs event before the replacement file is
+  -- visible.  The watcher can safely queue that event and re-check at flush;
+  -- callers that only want to filter generated churn pass allow_missing.
+  return not allow_missing and vim.fn.filereadable(path) ~= 1
 end
 
 local function flush_codex_edit_watch()
@@ -4630,7 +4794,10 @@ local function flush_codex_edit_watch()
   local preserve_focus = codex_terminal_buffer(focused_buf)
     or codecompanion_input_window(focused_win)
     or focused_mode:match("^[it]") ~= nil
-  local preview_opts = { preserve_focus = preserve_focus }
+  local preview_opts = {
+    preserve_focus = preserve_focus,
+    prepare_codex_diff_pages = true,
+  }
   open_edited_files_in_center({ first_path }, preview_opts)
   if package.loaded["gitsigns"] then
     pcall(function()
@@ -4686,6 +4853,12 @@ local function start_codex_edit_watch()
           if not path:match("^/") then
             path = root .. "/" .. path
           end
+          -- Drop generated/build churn before it enters Neovim's scheduled
+          -- queue.  This keeps the TUI event loop free for mouse clicks while
+          -- a project watcher or bundler is active.
+          if ignored_codex_edit_path(root, path, true) then
+            return
+          end
           queue_codex_edit_path(path)
         end
       end)
@@ -4733,6 +4906,7 @@ end, {
 
 vim.keymap.set("n", "<leader>gd", open_codex_diff, { desc = "Git/Codex çalışma ağacı diff'i" })
 vim.keymap.set("n", "<leader>gq", close_codex_inline_diff, { desc = "Inline diff görünümünü kapat" })
+vim.keymap.set("n", "<leader>dA", accept_all_codex_pages, { desc = "Açık tüm Codex diff sayfalarını kabul et" })
 vim.keymap.set("n", "<leader>gh", "<cmd>DiffviewFileHistory %<cr>", { desc = "Dosya Git geçmişi" })
 vim.keymap.set("n", "<leader>e", "<cmd>NvimTreeToggle<cr>", { desc = "Dosya yöneticisini aç/kapat" })
 vim.keymap.set("n", "<leader>o", "<cmd>NvimTreeFindFileToggle<cr>", { desc = "Dosyayı ağaçta bul" })
@@ -5510,8 +5684,9 @@ require("lazy").setup({
           end
 
           -- Mouse release can arrive before nvim-tree has moved its cursor to
-          -- the clicked row.  Deferring by one event-loop tick fixes the
-          -- occasional wrong-file/no-file opening reported by users.
+          -- the clicked row.  A tiny defer lets its own cursor handler finish
+          -- without adding a visible click delay (the old 10ms wait felt
+          -- sluggish in terminal UIs).
           local function open_after_mouse(opener)
             vim.defer_fn(function()
               if not vim.api.nvim_buf_is_valid(bufnr) then
@@ -5521,7 +5696,7 @@ require("lazy").setup({
               if ok and node then
                 open_node(node, opener)
               end
-            end, 10)
+            end, 2)
           end
 
           -- A single click opens after the cursor has settled.  The same

@@ -64,14 +64,18 @@ vibevim install
 ### Automatic npm releases
 
 Every push to `main` that changes the packaged configuration runs
-`.github/workflows/publish-npm.yml`. The workflow publishes the package with
-provenance. npm versions are immutable, so if the version in `package.json`
-already exists on npm, the workflow advances the patch version, publishes it,
-and commits that version back to `main` with `[skip ci]`.
+`.github/workflows/publish-npm.yml`. The workflow uses npm Trusted Publishing
+(OIDC) with Node/npm 24 and publishes provenance without a long-lived token.
+npm versions are immutable, so if the version in `package.json` already exists
+on npm, the workflow advances the patch version, publishes it, and commits that
+version back to `main` with `[skip ci]`.
 
-For the workflow to publish, add an npm automation or granular publish token as
-the repository secret `NPM_TOKEN` in **Settings → Secrets and variables →
-Actions**. The secret value is never stored in this repository.
+One-time npm setup: open **vibevim → Settings → Trusted Publisher** on
+npmjs.com, choose **GitHub Actions**, and enter organization/user
+`NeronSignal`, repository `VibeVim`, workflow filename
+`publish-npm.yml`, and allow **npm publish**. The workflow also accepts an
+optional `NPM_TOKEN` Actions secret when it is a 2FA-bypass automation token;
+ordinary login tokens will correctly fail rather than prompting for an OTP.
 
 ### Codex credentials and provider settings
 
@@ -98,7 +102,8 @@ Keep API keys in your shell/keychain; never commit them to init.lua or a dotfile
 | :TerminalNew | Choose Shell, Codex, OpenCode, Claude, or a custom terminal command |
 | :ThemeSelect | Choose a dark or light theme |
 | :CodexDiff [path] | Show one file's inline diff in the centre editor |
-| Floating diff toolbar | Drag its title bar; use ↑/↓ to move between changes, ✓ KABUL to accept every hunk in the file, or X to hide the toolbar |
+| :CodexDiffAcceptAllPages / <leader>dA | Accept every open Codex-edited file at once |
+| Floating diff toolbar | Drag its title bar; use ↑/↓ to move between changes, ✓ DOSYA for every hunk in the file, ✓ TÜM SAYFALAR for every open Codex-edited file, or X to hide the toolbar |
 
 The complete mouse and keymap reference is available from F1 → ? or :NvimShortcuts.
 
@@ -128,7 +133,7 @@ Yapay zekâ destekli kodlama için fare kullanımını kolaylaştıran, masaüst
 Shell, Codex, OpenCode ve Claude oturumları sağdaki tek terminal panelinde sekme
 olarak tutulur; yeni terminal açmak ek bir pencere/split oluşturmaz.
 
-Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. Editör üzerinde taşınabilir diff aracı ↑/↓ ile değişiklikler arasında dolaşır; ✓ Kabul dosyadaki tüm hunks'ları (yeni dosya dahil) tek seferde kabul eder. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
+Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. Editör üzerinde taşınabilir diff aracı ↑/↓ ile değişiklikler arasında dolaşır; ✓ DOSYA aktif dosyadaki tüm hunks'ları (yeni dosya dahil), ✓ TÜM SAYFALAR ise açık tüm Codex dosyalarını tek seferde kabul eder. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
 
 Varsayılan tema Flexoki Dark'tır; header'daki tema düğmesinden veya :ThemeSelect komutundan diğer koyu/açık temalara geçebilirsiniz.
 Üretilmiş `*.map`, `*.tsbuildinfo`, minified/bundle çıktıları, lock/cache/debug-log
@@ -152,12 +157,15 @@ GitHub’daki güncel sürümü kullanmak için `npm install --global github:Ner
 ### GitHub → npm otomatik yayın
 
 `main` dalına paket içeriğini etkileyen her push, `.github/workflows/publish-npm.yml`
-iş akışını çalıştırır. `package.json` sürümü npm’de zaten varsa iş akışı patch
-sürümünü otomatik artırır, paketi provenance ile yayınlar ve yeni sürümü
-`[skip ci]` commit’iyle GitHub’a geri yazar.
+iş akışını çalıştırır. İş akışı Node/npm 24 ve npm Trusted Publishing (OIDC)
+kullanır; uzun ömürlü token saklamadan provenance imzalı yayın yapar.
+`package.json` sürümü npm’de zaten varsa patch sürümünü otomatik artırır,
+yayınlar ve yeni sürümü `[skip ci]` commit’iyle GitHub’a geri yazar.
 
-Yayın yetkisi için GitHub deposunda **Settings → Secrets and variables →
-Actions** bölümüne `NPM_TOKEN` adlı npm automation/granular publish token
-secret’ı ekleyin. Token repoya yazılmaz.
+Tek seferlik npm ayarı: npmjs.com’da **vibevim → Settings → Trusted Publisher**
+bölümünden **GitHub Actions** seçin; kullanıcı/organizasyon `NeronSignal`,
+repo `VibeVim`, workflow dosyası `publish-npm.yml` ve izin olarak **npm
+publish** girin. İsteğe bağlı `NPM_TOKEN` yalnızca 2FA atlamalı automation
+token ise kullanılabilir; normal giriş token’ı CI’da OTP isteyeceğinden çalışmaz.
 
 Katkı göndermek için bir branch açın, temiz bir test profiliyle Neovim'i başlatın ve işletim sistemi/terminal/Neovim sürümünü açıklayın. Gizli anahtarları, özel endpoint'leri ve proje loglarını commit etmeyin.
