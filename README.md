@@ -15,6 +15,10 @@ The screenshot shows the intended three-pane workflow: project files on the left
 - **Mouse-friendly file workflow**: NvimTree, clickable header/menu, buffer tabs with a visible x, middle-click closing, and safe routing of file-tab clicks away from terminal panels.
 - **Independent terminals**: create separate Shell, Codex, OpenCode, Claude Code, or custom command sessions without replacing the managed Codex pane.
 - **Rich previews**: Glimpse previews images, video, archives, SQLite, documents, diagrams, and other formats when the terminal/protocol and optional tools are available.
+- **Quiet generated files**: source maps, `tsbuildinfo`, minified/bundle output,
+  lock/cache/debug-log metadata, and common build directories stay out of the tree,
+  file tabs, and automatic Codex diff previews (explicit `:edit` remains
+  available when inspection is intentional).
 - **Navigation and diagnostics**: Treesitter highlighting/indentation, Trouble, GitSigns, Diffview, Browse, and mini.nvim utilities.
 - **Themes**: Flexoki Dark is the default; Catppuccin, Kanagawa, and Flexoki dark/light choices are available from the header or :ThemeSelect.
 - **Console transcripts**: console-*.log buffers are presented without editor line numbers/sign noise and highlight timestamps, URLs, and log levels.
@@ -93,6 +97,9 @@ Yapay zekâ destekli kodlama için fare kullanımını kolaylaştıran, masaüst
 Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
 
 Varsayılan tema Flexoki Dark'tır; header'daki tema düğmesinden veya :ThemeSelect komutundan diğer koyu/açık temalara geçebilirsiniz.
+Üretilmiş `*.map`, `*.tsbuildinfo`, minified/bundle çıktıları, lock/cache/debug-log
+metadata ve yaygın build klasörleri dosya ağacında, sekmelerde ve otomatik Codex
+diff önizlemesinde gösterilmez; gerektiğinde `:edit` ile açıkça açabilirsiniz.
 
 Kurulum için mevcut ~/.config/nvim klasörünü yedekleyip depoyu klonlayın. Eklentiler ilk açılışta lazy.nvim tarafından kurulur. API anahtarlarını repoya yazmayın; Codex girişini ve sağlayıcı ayarlarını ortam değişkenleri veya kendi Codex yapılandırmanız üzerinden yapın.
 

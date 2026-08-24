@@ -102,6 +102,271 @@ if vim.fn.executable(clt_clang) == 1 and vim.uv.fs_stat(clt_sdk) then
   end
 end
 
+-- TypeScript incremental metadata (for example tsconfig.tsbuildinfo), source
+-- maps, lockfiles and .info manifests can be megabytes of machine-generated
+-- JSON/YAML. They stay out of the file tree, buffer tabs and automatic Codex
+-- previews; explicitly opening one is still possible, but no background
+-- analyzer or watcher should pull it into the main review surface.
+-- Structured metadata gets a lower size threshold because one-line JSON can
+-- make Treesitter/Vim syntax spend more time parsing than the file size
+-- suggests. Known generated metadata is skipped even when it happens to be
+-- small.
+local large_file_bytes = 512 * 1024
+local structured_file_bytes = 256 * 1024
+local generated_heavy_file_patterns = {
+  "%.tsbuildinfo$",
+  "%.map$",
+  "%.min%.js$",
+  "%.min%.mjs$",
+  "%.min%.cjs$",
+  "%.min%.css$",
+  "%.min%.scss$",
+  "%.min%.less$",
+  "%.bundle%.js$",
+  "%.bundle%.mjs$",
+  "%.bundle%.css$",
+  "%.chunk%.js$",
+  "%.chunk%.mjs$",
+  "%.chunk%.css$",
+  "%.info$",
+  "%.cache$",
+  "npm%-debug%.log$",
+  "yarn%-debug%.log$",
+  "pnpm%-debug%.log$",
+  "debug%.log$",
+  "%.trace$",
+  "package%-lock%.json$",
+  "npm%-shrinkwrap%.json$",
+  "pnpm%-lock%.yaml$",
+  "pnpm%-lock%.yml$",
+  "yarn%.lock$",
+  "bun%.lockb$",
+  "composer%.lock$",
+  "cargo%.lock$",
+  "gemfile%.lock$",
+  "coverage%-final%.json$",
+  "webpack%-stats%.json$",
+}
+
+-- Files matching these names are generated build metadata or compressed
+-- bundles rather than useful source.  Keep this predicate independent from
+-- the size guard below: a tiny .map/.tsbuildinfo file is still noise, and a
+-- tracked/generated file must not reappear merely because Git reports it as
+-- modified.  The same predicate is reused by the tree, bufferline and Codex
+-- watchers so every surface agrees about what should be hidden.
+local function is_generated_noise_file(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+
+  local lower_path = vim.fn.fnamemodify(path, ":p"):lower()
+  for _, pattern in ipairs(generated_heavy_file_patterns) do
+    if lower_path:match(pattern) then
+      return true
+    end
+  end
+
+  -- Common generated directories can contain tracked artifacts in monorepos;
+  -- ignoring them here prevents a build watcher from opening an entire bundle
+  -- tree even when the directory is not listed in .gitignore.
+  for _, directory in ipairs({
+    "/node_modules",
+    "/.next",
+    "/dist",
+    "/build",
+    "/target",
+    "/coverage",
+    "/vendor",
+    "/.cache",
+  }) do
+    if lower_path:find(directory .. "/", 1, true)
+        or lower_path:sub(-#directory) == directory then
+      return true
+    end
+  end
+
+  local basename = vim.fn.fnamemodify(lower_path, ":t")
+  -- Tooling often omits `.min` but labels an emitted bundle/chunk explicitly.
+  -- Do not classify every large JavaScript file as minified; source projects
+  -- legitimately keep large readable files.
+  return basename:match("^bundle[-_.]") ~= nil
+    or basename:match("^chunk[-_.]") ~= nil
+    or basename:match("^vendor[-_.].*%.[cm]?js$") ~= nil
+end
+
+local function is_large_or_generated_file(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+  local lower_path = path:lower()
+  if is_generated_noise_file(path) then
+    return true
+  end
+  local stat = uv.fs_stat(path)
+  if not stat or type(stat.size) ~= "number" then
+    return false
+  end
+  if stat.size >= large_file_bytes then
+    return true
+  end
+  -- Lower the cutoff only for formats that are commonly machine-generated.
+  -- Ordinary source files keep the conservative 512 KiB threshold.
+  local structured = lower_path:match("%.jsonc?$")
+    or lower_path:match("%.ya?ml$")
+    or lower_path:match("%.lock$")
+    or lower_path:match("%.info$")
+  return structured and stat.size >= structured_file_bytes or false
+end
+
+local large_file_window_state = {}
+
+local function remember_large_file_window(winid)
+  if large_file_window_state[winid] or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+  large_file_window_state[winid] = {
+    wrap = vim.wo[winid].wrap,
+    linebreak = vim.wo[winid].linebreak,
+    foldmethod = vim.wo[winid].foldmethod,
+    foldenable = vim.wo[winid].foldenable,
+    cursorline = vim.wo[winid].cursorline,
+    cursorcolumn = vim.wo[winid].cursorcolumn,
+    signcolumn = vim.wo[winid].signcolumn,
+    foldcolumn = vim.wo[winid].foldcolumn,
+  }
+end
+
+local function restore_large_file_windows(bufnr)
+  for _, winid in ipairs(vim.fn.win_findbuf(bufnr)) do
+    local state = large_file_window_state[winid]
+    if state and vim.api.nvim_win_is_valid(winid) then
+      for option, value in pairs(state) do
+        vim.wo[winid][option] = value
+      end
+    end
+    large_file_window_state[winid] = nil
+  end
+end
+
+local function stop_large_file_language_clients(bufnr)
+  if not vim.lsp or type(vim.lsp.get_clients) ~= "function" then
+    return
+  end
+  for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+    if type(vim.lsp.buf_detach_client) == "function" then
+      pcall(vim.lsp.buf_detach_client, bufnr, client.id)
+    end
+  end
+end
+
+local function mark_large_file_buffer(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if not is_large_or_generated_file(path) then
+    -- :edit can reuse a buffer number. Clear the marker and local switches so
+    -- a normal source file does not inherit the lightweight viewer mode.
+    if vim.b[bufnr].personal_large_file == true then
+      vim.b[bufnr].personal_large_file = nil
+      vim.b[bufnr].minidiff_disable = nil
+      vim.b[bufnr].miniindentscope_disable = nil
+      vim.b[bufnr].gitsigns_disable = nil
+      vim.b[bufnr].lsp_format_disabled = nil
+      vim.bo[bufnr].swapfile = vim.go.swapfile
+      vim.bo[bufnr].undofile = vim.go.undofile
+      vim.bo[bufnr].modeline = vim.go.modeline
+      restore_large_file_windows(bufnr)
+    end
+    return false
+  end
+
+  vim.b[bufnr].personal_large_file = true
+  -- mini.diff and mini.indentscope both honour these buffer-local switches.
+  vim.b[bufnr].minidiff_disable = true
+  vim.b[bufnr].miniindentscope_disable = true
+  vim.b[bufnr].gitsigns_disable = true
+  vim.b[bufnr].lsp_format_disabled = true
+  vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].undofile = false
+  vim.bo[bufnr].modeline = false
+  -- Long generated lines are expensive for Vim's regex syntax engine.  Keep
+  -- the JSON/YAML filetype for commands and search, but leave highlighting to
+  -- the lightweight plain-text renderer.
+  vim.bo[bufnr].syntax = ""
+  if vim.treesitter and type(vim.treesitter.stop) == "function" then
+    pcall(vim.treesitter.stop, bufnr)
+  end
+  stop_large_file_language_clients(bufnr)
+  for _, winid in ipairs(vim.fn.win_findbuf(bufnr)) do
+    if vim.api.nvim_win_is_valid(winid) then
+      remember_large_file_window(winid)
+      vim.wo[winid].wrap = false
+      vim.wo[winid].linebreak = false
+      vim.wo[winid].foldmethod = "manual"
+      vim.wo[winid].foldenable = false
+      vim.wo[winid].cursorline = false
+      vim.wo[winid].cursorcolumn = false
+      vim.wo[winid].signcolumn = "no"
+      vim.wo[winid].foldcolumn = "0"
+    end
+  end
+  return true
+end
+
+local large_file_group = vim.api.nvim_create_augroup("PersonalNvimLargeFileGuard", { clear = true })
+vim.api.nvim_create_autocmd({
+  "BufReadPre",
+  "BufNewFile",
+  "BufReadPost",
+  "BufEnter",
+  "BufWinEnter",
+  "WinEnter",
+  "FileType",
+}, {
+  group = large_file_group,
+  callback = function(event)
+    mark_large_file_buffer(event.buf)
+  end,
+})
+
+-- A Codex diff that the user explicitly accepts becomes the new review
+-- baseline for this Neovim session. Git still records the worktree change, but
+-- the accepted hunk is no longer painted red/green until the file changes
+-- again. Keeping this in memory avoids writing project-specific state files.
+local codex_diff_baselines = {}
+
+local function codex_diff_path_key(path)
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+  path = vim.fn.fnamemodify(path, ":p")
+  local realpath = uv.fs_realpath and uv.fs_realpath(path)
+  return realpath or path
+end
+
+local function remember_codex_diff_baseline(path, lines)
+  local key = codex_diff_path_key(path)
+  if not key or type(lines) ~= "table" then
+    return false
+  end
+  codex_diff_baselines[key] = vim.deepcopy(lines)
+  return true
+end
+
+local function codex_diff_baseline_for(path)
+  local key = codex_diff_path_key(path)
+  local lines = key and codex_diff_baselines[key]
+  return lines and vim.deepcopy(lines) or nil
+end
+
+local function codex_buffer_lines(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+end
+
 local function refresh_current_buffer()
   if vim.bo.buftype == "" then
     pcall(vim.cmd, "checktime")
@@ -120,6 +385,7 @@ local open_codex_diff
 local ensure_center_editor_window
 local open_edited_files_in_center
 local collapse_pending_codex_diff
+local install_codex_diff_navigation
 
 -- Codex CLI'nin YOLO ayarı ile codex.nvim'in openDiff onayı birbirinden
 -- bağımsızdır.  Bu küçük köprü, yalnızca gerçekten YOLO/full-access açıkken
@@ -200,12 +466,56 @@ local function install_codex_yolo_diff_wrapper()
 
   local original_setup = diff._setup_blocking_diff
   local original_close = diff.close_diff_by_tab_name
+  local original_resolve_saved = diff._resolve_diff_as_saved
   if type(original_setup) ~= "function" or type(original_close) ~= "function" then
     vim.notify("codex.nvim diff API değişti; YOLO diff köprüsü kurulamadı", vim.log.levels.WARN)
     return
   end
 
+  local function capture_input_focus()
+    local winid = vim.api.nvim_get_current_win()
+    local bufnr = vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) or 0
+    local mode = vim.api.nvim_get_mode().mode
+    local keep = vim.api.nvim_buf_is_valid(bufnr)
+      and (vim.bo[bufnr].buftype == "terminal"
+        or vim.bo[bufnr].filetype == "codecompanion_input"
+        or mode:match("^[it]") ~= nil)
+    return { winid = winid, mode = mode, keep = keep }
+  end
+
+  local function restore_input_focus(snapshot)
+    if type(snapshot) ~= "table" or not snapshot.keep then
+      return
+    end
+    vim.schedule(function()
+      if not vim.api.nvim_win_is_valid(snapshot.winid) then
+        return
+      end
+      pcall(vim.api.nvim_set_current_win, snapshot.winid)
+      if snapshot.mode:match("^[it]") then
+        pcall(vim.cmd, "startinsert")
+      end
+    end)
+  end
+
+  -- Capture the accepted buffer before codex.nvim later removes its temporary
+  -- diff buffer. This snapshot becomes the next baseline for inline review.
+  if type(original_resolve_saved) == "function" then
+    diff._resolve_diff_as_saved = function(tab_name, buffer_id)
+      local active = diff._get_active_diffs and diff._get_active_diffs() or {}
+      local state = active[tab_name]
+      local accepted_path = state and state.old_file_path
+      local accepted_lines = codex_buffer_lines(buffer_id)
+      local result = original_resolve_saved(tab_name, buffer_id)
+      if accepted_path and accepted_lines then
+        remember_codex_diff_baseline(accepted_path, accepted_lines)
+      end
+      return result
+    end
+  end
+
   diff._setup_blocking_diff = function(params, resolution_callback)
+    local input_focus = capture_input_focus()
     -- codex.nvim normally picks the first non-terminal window.  In our
     -- three-pane layout that can be nvim-tree, so preload the target file in
     -- the real centre editor before the plugin chooses its diff window.
@@ -213,7 +523,13 @@ local function install_codex_yolo_diff_wrapper()
         and params.old_file_path ~= "" and open_edited_files_in_center then
       local old_path = vim.fn.fnamemodify(params.old_file_path, ":p")
       if vim.fn.filereadable(old_path) == 1 then
-        open_edited_files_in_center({ old_path })
+        local focused_win = vim.api.nvim_get_current_win()
+        local focused_buf = vim.api.nvim_win_get_buf(focused_win)
+        local focused_mode = vim.api.nvim_get_mode().mode
+        local preserve_focus = vim.bo[focused_buf].buftype == "terminal"
+          or vim.bo[focused_buf].filetype == "codecompanion_input"
+          or focused_mode:match("^[it]") ~= nil
+        open_edited_files_in_center({ old_path }, { preserve_focus = preserve_focus })
         local bufnr = vim.fn.bufnr(old_path)
         if bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) then
           vim.api.nvim_buf_call(bufnr, function()
@@ -227,6 +543,7 @@ local function install_codex_yolo_diff_wrapper()
     -- immediately so the user sees one centre tab with mini.diff's inline
     -- red/green overlay instead of the duplicate side-by-side layout.
     collapse_pending_codex_diff(diff, params)
+    restore_input_focus(input_focus)
     if codex_yolo_enabled() then
       vim.schedule(function()
         local active = diff._get_active_diffs and diff._get_active_diffs() or {}
@@ -249,7 +566,13 @@ local function install_codex_yolo_diff_wrapper()
       -- close_tab, Codex'in dosyayı diske yazmasından sonra gelir.  Reload ve
       -- Diffview açılışı arasında küçük bir pay bırakıyoruz.
       vim.defer_fn(function()
-        open_codex_diff(edited_path)
+        local focused_win = vim.api.nvim_get_current_win()
+        local focused_buf = vim.api.nvim_win_get_buf(focused_win)
+        local focused_mode = vim.api.nvim_get_mode().mode
+        local preserve_focus = vim.bo[focused_buf].buftype == "terminal"
+          or vim.bo[focused_buf].filetype == "codecompanion_input"
+          or focused_mode:match("^[it]") ~= nil
+        open_codex_diff(edited_path, { preserve_focus = preserve_focus })
       end, 500)
     end
     return result
@@ -321,6 +644,25 @@ local codex_input_focus_group = vim.api.nvim_create_augroup("PersonalNvimCodexIn
 -- debounced: a single response can emit hundreds of on_bytes notifications.
 local codex_scroll_states = {}
 
+local function stop_codex_scroll_timer(state)
+  if state and state.timer then
+    pcall(state.timer.stop, state.timer)
+    pcall(state.timer.close, state.timer)
+    state.timer = nil
+  end
+end
+
+local function codex_window_is_at_bottom(winid, bufnr)
+  if not vim.api.nvim_win_is_valid(winid) or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local last_visible = vim.api.nvim_win_call(winid, function()
+    return vim.fn.line("w$")
+  end)
+  return type(last_visible) == "number" and last_visible >= line_count
+end
+
 local function scroll_codex_terminal_to_bottom(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) or not codex_terminal_buffer(bufnr) then
     return
@@ -333,6 +675,12 @@ local function scroll_codex_terminal_to_bottom(bufnr)
 
   local state = codex_scroll_states[bufnr]
   if not state then
+    return
+  end
+  -- A user who scrolls up is reading history. Do not move the cursor back to
+  -- the composer until the user returns to the bottom of the terminal.
+  if state.follow == false and state.force ~= true then
+    state.pending = true
     return
   end
   -- Updating an unfocused terminal window's cursor forces a redraw of that
@@ -381,6 +729,7 @@ local function scroll_codex_terminal_to_bottom(bufnr)
         -- pane is focused (or a quiet flush is explicitly due) and makes
         -- Neovim redraw the viewport at the bottom.
         pcall(function()
+          state.auto_scroll = true
           vim.wo[winid].scrolloff = 0
           vim.wo[winid].cursorline = false
           vim.wo[winid].cursorcolumn = false
@@ -388,6 +737,11 @@ local function scroll_codex_terminal_to_bottom(bufnr)
           if force or cursor[1] ~= line_count then
             vim.api.nvim_win_set_cursor(winid, { line_count, 0 })
           end
+          vim.defer_fn(function()
+            if codex_scroll_states[bufnr] == state then
+              state.auto_scroll = false
+            end
+          end, 60)
         end)
       end
     end
@@ -406,11 +760,7 @@ local function schedule_codex_terminal_bottom(bufnr, delay, background_flush)
   if delay == 0 then
     -- A focus request must not wait behind a quiet-period timer scheduled
     -- while the user was working in another pane.
-    if state.timer then
-      pcall(state.timer.stop, state.timer)
-      pcall(state.timer.close, state.timer)
-      state.timer = nil
-    end
+    stop_codex_scroll_timer(state)
     state.force = true
     state.background_flush = false
   elseif background_flush then
@@ -418,11 +768,7 @@ local function schedule_codex_terminal_bottom(bufnr, delay, background_flush)
     -- Restart the quiet-period timer for every output batch.  A long turn
     -- therefore produces no cursor movement until Codex has actually gone
     -- quiet for the requested interval.
-    if state.timer then
-      pcall(state.timer.stop, state.timer)
-      pcall(state.timer.close, state.timer)
-      state.timer = nil
-    end
+    stop_codex_scroll_timer(state)
   end
   if state.timer then
     return
@@ -458,7 +804,10 @@ local function attach_codex_terminal_scroll(bufnr, attempt)
     return
   end
 
-  state = state or { attached = false }
+  state = state or { attached = false, follow = true }
+  if state.follow == nil then
+    state.follow = true
+  end
   state.attached = true
   codex_scroll_states[bufnr] = state
   pcall(function()
@@ -470,6 +819,12 @@ local function attach_codex_terminal_scroll(bufnr, attempt)
   local attached = vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function()
       local state = codex_scroll_states[bufnr]
+      if state and state.follow == false then
+        -- Keep the history viewport stable while the user is reading older
+        -- output. New terminal lines are still retained in scrollback; only
+        -- the automatic cursor-follow operation is paused.
+        return
+      end
       -- Never move the background terminal cursor for every output batch while
       -- another pane owns focus.  A quiet-period timer below performs one
       -- catch-up scroll after the stream settles (or immediately on WinEnter).
@@ -497,12 +852,9 @@ local function attach_codex_terminal_scroll(bufnr, attempt)
       end
       schedule_codex_terminal_bottom(bufnr)
     end,
-    on_detach = function()
-      local current = codex_scroll_states[bufnr]
-      if current and current.timer then
-        pcall(current.timer.stop, current.timer)
-        pcall(current.timer.close, current.timer)
-      end
+  on_detach = function()
+    local current = codex_scroll_states[bufnr]
+      stop_codex_scroll_timer(current)
       codex_scroll_states[bufnr] = nil
     end,
   })
@@ -523,6 +875,12 @@ local function codex_focus_window(winid)
     return
   end
   attach_codex_terminal_scroll(bufnr)
+  local state = codex_scroll_states[bufnr]
+  if state then
+    -- Returning to the Codex pane is an explicit request for the composer;
+    -- resume follow mode after a previous history scroll.
+    state.follow = true
+  end
 
   vim.schedule(function()
     if not vim.api.nvim_win_is_valid(winid) or vim.api.nvim_get_current_win() ~= winid then
@@ -536,6 +894,39 @@ local function codex_focus_window(winid)
     end
   end)
 end
+
+-- WinScrolled is the one reliable signal that distinguishes a user's
+-- mouse-wheel/PageUp history read from terminal output. Pause the follower
+-- above the bottom line and resume it only when the user reaches the newest
+-- output again. Programmatic cursor moves are tagged by scroll_codex_terminal
+-- and ignored for this decision.
+vim.api.nvim_create_autocmd("WinScrolled", {
+  group = codex_input_focus_group,
+  callback = function(event)
+    local winid = tonumber(event.match) or vim.api.nvim_get_current_win()
+    if not vim.api.nvim_win_is_valid(winid) then
+      return
+    end
+    local bufnr = vim.api.nvim_win_get_buf(winid)
+    if not codex_terminal_buffer(bufnr) then
+      return
+    end
+    local state = codex_scroll_states[bufnr]
+    if not state or state.auto_scroll then
+      return
+    end
+    if codex_window_is_at_bottom(winid, bufnr) then
+      state.follow = true
+      state.pending = false
+      state.force = false
+    else
+      state.follow = false
+      state.pending = true
+      state.force = false
+      stop_codex_scroll_timer(state)
+    end
+  end,
+})
 
 vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "TermOpen" }, {
   group = codex_input_focus_group,
@@ -1431,6 +1822,7 @@ local function enable_codex_inline_overlay(bufnr, reference_lines)
   -- Native codex.nvim proposed buffers are converted to that shape by the
   -- pending-diff adapter below before this function is called.
   vim.b[bufnr].personal_codex_diff = true
+  install_codex_diff_navigation(bufnr)
   vim.bo[bufnr].buflisted = true
 
   local data = type(mini_diff.get_buf_data) == "function" and mini_diff.get_buf_data(bufnr) or nil
@@ -1560,10 +1952,11 @@ end
 -- Doğrudan Codex terminalinden yapılan değişiklikleri tek komutla yenile ve
 -- çalışma ağacı diff'ini aç. codex.nvim'in openDiff akışı yerel değişiklikleri
 -- otomatik önizler; bu komut Git çalışma ağacı için tamamlayıcıdır.
-open_codex_diff = function(context_path)
+open_codex_diff = function(context_path, opts)
   if type(context_path) == "table" then
     context_path = context_path.args
   end
+  opts = type(opts) == "table" and opts or {}
   if type(context_path) ~= "string" or context_path == "" then
     local current_name = vim.api.nvim_buf_get_name(0)
     if current_name ~= "" and not current_name:match("^term://") and not current_name:match("^diffview://") then
@@ -1577,7 +1970,22 @@ open_codex_diff = function(context_path)
   local reference_root
   if type(context_path) == "string" and context_path ~= "" then
     normalized_context = vim.fn.fnamemodify(context_path, ":p")
-    reference_lines, reference_root = git_reference_lines_for_path(normalized_context)
+    if is_generated_noise_file(normalized_context) then
+      vim.notify(
+        "Üretilmiş/metadata dosyası diff önizlemesinden gizlendi: "
+          .. vim.fn.fnamemodify(normalized_context, ":t"),
+        vim.log.levels.INFO
+      )
+      return
+    end
+    reference_lines = codex_diff_baseline_for(normalized_context)
+    if reference_lines ~= nil then
+      -- Keep the project root for the status message, but prefer the accepted
+      -- in-session snapshot over Git's older index when painting this file.
+      reference_root = git_root_for_current_context(normalized_context)
+    else
+      reference_lines, reference_root = git_reference_lines_for_path(normalized_context)
+    end
     -- Close an older side-by-side view before selecting the centre editor.
     -- Diffview's right pane otherwise looks like a second file tab and can be
     -- mistaken for the requested single-file Codex preview.
@@ -1585,7 +1993,7 @@ open_codex_diff = function(context_path)
     -- Make the edited file visible in the centre editor even when Git is not
     -- available; the file itself is still useful in that case.
     if vim.fn.filereadable(normalized_context) == 1 and open_edited_files_in_center then
-      local opened = open_edited_files_in_center({ normalized_context })
+      local opened = open_edited_files_in_center({ normalized_context }, opts)
       local bufnr = opened and opened[1] or vim.fn.bufnr(normalized_context)
       if bufnr and bufnr > 0 then
         enable_codex_inline_overlay(bufnr, reference_lines)
@@ -1618,6 +2026,191 @@ open_codex_diff = function(context_path)
     end
   end, 80)
 end
+
+local function mini_diff_module_if_loaded()
+  local module = rawget(_G, "MiniDiff")
+  if type(module) == "table" and type(module.get_buf_data) == "function" then
+    return module
+  end
+  if package.loaded["mini.diff"] then
+    local ok, loaded = pcall(require, "mini.diff")
+    if ok and type(loaded) == "table" then
+      return loaded
+    end
+  end
+  return nil
+end
+
+local function mini_diff_data_for_buffer(bufnr)
+  local mini_diff = mini_diff_module_if_loaded()
+  if not mini_diff or type(mini_diff.get_buf_data) ~= "function" then
+    return nil, mini_diff
+  end
+  local ok, data = pcall(mini_diff.get_buf_data, bufnr)
+  return ok and type(data) == "table" and data or nil, mini_diff
+end
+
+local function hunk_for_cursor(data, bufnr)
+  if type(data) ~= "table" or type(data.hunks) ~= "table" or #data.hunks == 0 then
+    return nil
+  end
+  local line = 1
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid ~= -1 and vim.api.nvim_win_is_valid(winid) then
+    line = vim.api.nvim_win_get_cursor(winid)[1]
+  elseif bufnr == vim.api.nvim_get_current_buf() then
+    line = vim.api.nvim_win_get_cursor(0)[1]
+  end
+
+  local nearest, nearest_distance
+  for _, hunk in ipairs(data.hunks) do
+    local from = math.max(1, tonumber(hunk.buf_start) or 1)
+    local to = from + math.max(tonumber(hunk.buf_count) or 0, 1) - 1
+    if line >= from and line <= to then
+      return hunk
+    end
+    local distance = line < from and from - line or line - to
+    if not nearest_distance or distance < nearest_distance then
+      nearest, nearest_distance = hunk, distance
+    end
+  end
+  return nearest
+end
+
+local function reference_text_lines(text)
+  if type(text) ~= "string" then
+    return nil
+  end
+  local lines = vim.split(text, "\n", { plain = true, trimempty = false })
+  -- MiniDiff stores a trailing newline in ref_text; buffer lines do not.
+  if #lines > 0 and lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  return lines
+end
+
+local function accept_codex_hunk(bufnr)
+  bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
+  local data, mini_diff = mini_diff_data_for_buffer(bufnr)
+  if not data or not mini_diff or type(mini_diff.set_ref_text) ~= "function" then
+    vim.notify("Bu dosyada kabul edilecek bir Codex değişikliği yok", vim.log.levels.INFO)
+    return false
+  end
+  local hunk = hunk_for_cursor(data, bufnr)
+  local current_lines = codex_buffer_lines(bufnr)
+  local ref_lines = reference_text_lines(data.ref_text)
+  if not hunk or not current_lines or not ref_lines then
+    vim.notify("Codex değişiklik temeli henüz hazır değil", vim.log.levels.WARN)
+    return false
+  end
+
+  local ref_start = math.max(1, tonumber(hunk.ref_start) or 1)
+  local ref_count = math.max(0, tonumber(hunk.ref_count) or 0)
+  local buf_start = math.max(1, tonumber(hunk.buf_start) or 1)
+  local buf_count = math.max(0, tonumber(hunk.buf_count) or 0)
+  local next_ref = {}
+  for index = 1, math.min(ref_start - 1, #ref_lines) do
+    next_ref[#next_ref + 1] = ref_lines[index]
+  end
+  for index = buf_start, math.min(buf_start + buf_count - 1, #current_lines) do
+    next_ref[#next_ref + 1] = current_lines[index]
+  end
+  local after = ref_start + ref_count
+  for index = after, #ref_lines do
+    next_ref[#next_ref + 1] = ref_lines[index]
+  end
+
+  local path = vim.b[bufnr].codex_diff_file_path
+  if type(path) ~= "string" or path == "" then
+    path = vim.api.nvim_buf_get_name(bufnr)
+  end
+  remember_codex_diff_baseline(path, next_ref)
+  vim.b[bufnr].codex_diff_reference_lines = vim.deepcopy(next_ref)
+  pcall(mini_diff.set_ref_text, bufnr, next_ref)
+  vim.schedule(function()
+    pcall(vim.cmd, "redrawtabline")
+  end)
+  vim.notify("Bu değişiklik kabul edildi; tekrar değişene kadar gizlendi", vim.log.levels.INFO)
+  return true
+end
+
+local function goto_codex_hunk(direction, bufnr)
+  bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
+  local data, mini_diff = mini_diff_data_for_buffer(bufnr)
+  if not data or not mini_diff or type(mini_diff.goto_hunk) ~= "function" then
+    return false
+  end
+  if type(data.hunks) ~= "table" or #data.hunks == 0 then
+    vim.notify("Bu dosyada açık bir değişiklik yok", vim.log.levels.INFO)
+    return false
+  end
+  local winid = vim.fn.bufwinid(bufnr)
+  if winid ~= -1 and vim.api.nvim_win_is_valid(winid) then
+    pcall(vim.api.nvim_set_current_win, winid)
+  end
+  local ok, err = pcall(mini_diff.goto_hunk, direction, { wrap = true })
+  if not ok then
+    vim.notify("Değişiklik konumuna gidilemedi: " .. tostring(err), vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
+install_codex_diff_navigation = function(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  vim.keymap.set("n", "]d", function()
+    goto_codex_hunk("next", bufnr)
+  end, { buffer = bufnr, silent = true, nowait = true, desc = "Sonraki Codex değişikliği" })
+  vim.keymap.set("n", "[d", function()
+    goto_codex_hunk("prev", bufnr)
+  end, { buffer = bufnr, silent = true, nowait = true, desc = "Önceki Codex değişikliği" })
+  vim.keymap.set("n", "<leader>da", function()
+    accept_codex_hunk(bufnr)
+  end, { buffer = bufnr, silent = true, nowait = true, desc = "Bu Codex değişikliğini kabul et" })
+end
+
+_G.NvimDiffNavigateClick = function(minwid, clicks)
+  local id = tonumber(minwid) or 0
+  if tonumber(clicks) and tonumber(clicks) > 1 then
+    return
+  end
+  local now = (vim.uv or vim.loop).hrtime() / 1e6
+  local previous = vim.g.personal_nvim_diff_click
+  if type(previous) == "table" and previous.id == id and now - (tonumber(previous.at) or 0) < 220 then
+    return
+  end
+  vim.g.personal_nvim_diff_click = { id = id, at = now }
+  vim.schedule(function()
+    local winid = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+    if not vim.api.nvim_win_is_valid(winid) then
+      return
+    end
+    local bufnr = vim.api.nvim_win_get_buf(winid)
+    if id == 9201 then
+      goto_codex_hunk("prev", bufnr)
+    elseif id == 9202 then
+      goto_codex_hunk("next", bufnr)
+    elseif id == 9203 then
+      accept_codex_hunk(bufnr)
+    end
+  end)
+end
+
+vim.api.nvim_create_user_command("CodexDiffAcceptHunk", function()
+  accept_codex_hunk(vim.api.nvim_get_current_buf())
+end, { desc = "İmleçteki Codex değişikliğini kabul et" })
+
+vim.api.nvim_create_autocmd("User", {
+  group = vim.api.nvim_create_augroup("PersonalNvimDiffNavigation", { clear = true }),
+  pattern = "MiniDiffUpdated",
+  callback = function()
+    vim.schedule(function()
+      pcall(vim.cmd, "redrawtabline")
+    end)
+  end,
+})
 
 local function close_codex_inline_diff()
   local closed_diffview = close_existing_diffview()
@@ -1678,16 +2271,22 @@ ensure_center_editor_window = function()
   return vim.api.nvim_get_current_win()
 end
 
-open_edited_files_in_center = function(paths)
+open_edited_files_in_center = function(paths, opts)
   if type(paths) ~= "table" then
     paths = { paths }
   end
+  opts = type(opts) == "table" and opts or {}
+  local original_win = vim.api.nvim_get_current_win()
+  local original_mode = vim.api.nvim_get_mode().mode
+  local preserve_focus = opts.preserve_focus == true
   local editor_win = ensure_center_editor_window()
   local opened = {}
   for _, path in ipairs(paths) do
     if type(path) == "string" and path ~= "" then
       path = vim.fn.fnamemodify(path, ":p")
-      if vim.fn.filereadable(path) == 1 then
+      -- Generated metadata/bundles are intentionally not opened as Codex
+      -- review tabs, even when a tool reports them as edited.
+      if not is_generated_noise_file(path) and vim.fn.filereadable(path) == 1 then
         local bufnr = vim.fn.bufadd(path)
         if bufnr > 0 then
           pcall(vim.fn.bufload, bufnr)
@@ -1698,14 +2297,31 @@ open_edited_files_in_center = function(paths)
     end
   end
   if #opened > 0 and vim.api.nvim_win_is_valid(editor_win) then
-    vim.api.nvim_set_current_win(editor_win)
     -- Set each buffer once so bufferline remembers all changed files, then
-    -- return to the first file reported by the agent.
+    -- return to the first file reported by the agent. nvim_win_set_buf works
+    -- on a non-current window, so a background Codex edit can update the
+    -- centre tab without stealing the user's input focus.
     for _, bufnr in ipairs(opened) do
       pcall(vim.api.nvim_win_set_buf, editor_win, bufnr)
     end
     pcall(vim.api.nvim_win_set_buf, editor_win, opened[1])
     vim.cmd("redrawtabline")
+  end
+
+  if preserve_focus and vim.api.nvim_win_is_valid(original_win) then
+    pcall(vim.api.nvim_set_current_win, original_win)
+    -- Creating the centre split temporarily leaves terminal/input mode. Put
+    -- the cursor back into the exact kind of prompt the user was typing in.
+    if original_mode:match("^[it]") then
+      vim.schedule(function()
+        if vim.api.nvim_win_is_valid(original_win)
+            and vim.api.nvim_get_current_win() == original_win then
+          pcall(vim.cmd, "startinsert")
+        end
+      end)
+    end
+  elseif vim.api.nvim_win_is_valid(editor_win) then
+    pcall(vim.api.nvim_set_current_win, editor_win)
   end
   return opened
 end
@@ -1810,13 +2426,145 @@ local function open_bufferline_buffer(bufnr)
   vim.schedule(apply)
 end
 
-local function close_current_buffer()
+-- Bufferline's close callback is also used by mouse/statusline events, so all
+-- file-closing paths go through this one guarded function.  mini.bufremove's
+-- default prompt only offers a force/no choice; VibeVim instead shows an
+-- explicit Save / Close / Cancel dialog and never deletes a modified buffer
+-- before that decision is made.
+local buffer_close_inflight = {}
+
+local function is_closable_file_buffer(bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  if vim.bo[bufnr].buftype ~= "" then
+    return false
+  end
+  return not vim.tbl_contains({
+    "NvimTree",
+    "DiffviewFiles",
+    "DiffviewFilePanel",
+    "DiffviewFileHistory",
+    "Trouble",
+    "lazy",
+    "qf",
+    "help",
+    "notify",
+    "codecompanion",
+  }, vim.bo[bufnr].filetype)
+end
+
+local function delete_buffer_preserving_layout(bufnr, force)
   local ok, bufremove = pcall(require, "mini.bufremove")
   if ok and type(bufremove.delete) == "function" then
-    bufremove.delete(0, false)
+    local deleted = pcall(bufremove.delete, bufnr, force == true)
+    if deleted and not vim.api.nvim_buf_is_valid(bufnr) then
+      return true
+    end
+  end
+
+  local deleted, err = pcall(vim.api.nvim_buf_delete, bufnr, { force = force == true })
+  if not deleted then
+    vim.notify("Dosya kapatılamadı: " .. tostring(err), vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
+local function save_buffer_before_close(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+    vim.cmd("silent update")
+  end)
+  if not ok then
+    vim.notify("Dosya kaydedilemedi: " .. tostring(err), vim.log.levels.ERROR)
+    return false
+  end
+  if vim.api.nvim_buf_is_valid(bufnr) and vim.bo[bufnr].modified then
+    vim.notify("Dosya hâlâ değiştirilmiş; kapatma iptal edildi", vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
+local function close_buffer_safely(bufnr)
+  bufnr = tonumber(bufnr) or vim.api.nvim_get_current_buf()
+  if not is_closable_file_buffer(bufnr) then
+    return false
+  end
+  if buffer_close_inflight[bufnr] then
+    return false
+  end
+  buffer_close_inflight[bufnr] = true
+
+  -- Statusline callbacks run under textlock.  Defer both the prompt and the
+  -- actual delete so a click cannot replace the tree/Codex window underneath
+  -- the same mouse gesture.
+  vim.schedule(function()
+    local function release_guard()
+      buffer_close_inflight[bufnr] = nil
+    end
+
+    if not is_closable_file_buffer(bufnr) then
+      release_guard()
+      return
+    end
+
+    local force = false
+    if vim.bo[bufnr].modified then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      name = name ~= "" and vim.fn.fnamemodify(name, ":t") or "Adsız dosya"
+      local choice = vim.fn.confirm(
+        name .. " içinde kaydedilmemiş değişiklik var",
+        "&Kaydet\n&Kapat\n&İptal",
+        1,
+        "Warning"
+      )
+      if choice == 1 then
+        if not save_buffer_before_close(bufnr) then
+          release_guard()
+          return
+        end
+      elseif choice == 2 then
+        force = true
+      else
+        release_guard()
+        return
+      end
+    end
+
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      delete_buffer_preserving_layout(bufnr, force)
+      vim.schedule(function()
+        pcall(vim.cmd, "redrawtabline")
+      end)
+    end
+    release_guard()
+  end)
+  return true
+end
+
+local function close_current_buffer()
+  local current = vim.api.nvim_get_current_buf()
+  if is_closable_file_buffer(current) then
+    close_buffer_safely(current)
     return
   end
-  control_command("confirm bdelete")
+
+  -- F8 can be pressed while the Codex/tree pane owns focus.  Resolve it to
+  -- the first real centre-editor buffer instead of deleting a terminal.
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if is_center_editor_window(winid) then
+      local bufnr = vim.api.nvim_win_get_buf(winid)
+      if is_closable_file_buffer(bufnr) then
+        close_buffer_safely(bufnr)
+        return
+      end
+    end
+  end
+  vim.notify("Kapatılacak bir dosya sekmesi yok", vim.log.levels.INFO)
 end
 
 local function open_nvim_settings()
@@ -1835,8 +2583,8 @@ end
 -- Generic terminal tabs are independent from codex.nvim's managed Codex
 -- terminal. Each session keeps its own process and buffer; only one generic
 -- terminal window is shown at a time, so opening a new one does not create a
--- pile of narrow splits. The terminal strip below lets the user switch or
--- close them without touching the editor layout.
+-- pile of narrow splits. The terminal strip at the top of the right-side
+-- session lets the user switch or close them without touching the editor.
 local terminal_sessions = {}
 local terminal_session_order = {}
 local terminal_session_next_id = 1
@@ -1941,8 +2689,12 @@ local function open_terminal_session(command, label)
     cwd = vim.fn.getcwd(),
     interactive = true,
     win = {
-      position = "bottom",
-      height = 0.30,
+      -- Keep all independent terminals in the right-hand work area.  The
+      -- winbar rendered by NvimControlBar() acts as their tab strip, while
+      -- the centre editor and file tabs retain their full height.
+      position = "right",
+      width = 0.34,
+      height = 0,
       relative = "editor",
       stack = false,
       border = "rounded",
@@ -2758,16 +3510,36 @@ local function control_header_bar()
   }) .. "%=%#TabLineSel# VibeVim "
 end
 
-local function file_tabs_bar()
+local function diff_navigation_bar(bufnr)
+  if type(bufnr) ~= "number" or vim.b[bufnr].personal_codex_diff ~= true then
+    return ""
+  end
+  local data = mini_diff_data_for_buffer(bufnr)
+  local hunks = data and data.hunks
+  if not data or data.overlay ~= true or type(hunks) ~= "table" or #hunks == 0 then
+    return ""
+  end
+  local ranges = data.summary and data.summary.n_ranges or #hunks
+  local label = ranges == 1 and " 1 değişiklik " or string.format(" %d değişiklik ", ranges)
+  return table.concat({
+    "  ",
+    string.format("%%9201@v:lua.NvimDiffNavigateClick@ [↑] %%T"),
+    string.format("%%9202@v:lua.NvimDiffNavigateClick@ [↓] %%T"),
+    string.format("%%9203@v:lua.NvimDiffNavigateClick@ [✓ kabul] %%T"),
+    label,
+  })
+end
+
+local function file_tabs_bar(bufnr)
   local renderer = rawget(_G, "nvim_bufferline")
   if type(renderer) ~= "function" then
-    return "%#TabLine#  DOSYALAR  "
+    return "%#TabLine#  DOSYALAR  " .. diff_navigation_bar(bufnr)
   end
   local ok, rendered = pcall(renderer)
   if ok and type(rendered) == "string" and rendered ~= "" then
-    return rendered
+    return rendered .. diff_navigation_bar(bufnr)
   end
-  return "%#TabLine#  DOSYALAR  "
+  return "%#TabLine#  DOSYALAR  " .. diff_navigation_bar(bufnr)
 end
 
 -- The bar is deliberately plain-text/Unicode rather than icon-dependent, so
@@ -2794,7 +3566,7 @@ local function control_winbar()
     return "%#TabLine#  Dosyalar  "
   end
   if is_center_editor_window(winid) then
-    return file_tabs_bar()
+    return file_tabs_bar(buf)
   end
   return control_header_bar()
 end
@@ -2991,8 +3763,18 @@ vim.api.nvim_create_autocmd("User", {
     if #incoming_paths == 0 then
       return
     end
+    local queued_path = false
     for _, path in ipairs(incoming_paths) do
-      codecompanion_edited_paths[vim.fn.fnamemodify(path, ":p")] = true
+      local normalized = vim.fn.fnamemodify(path, ":p")
+      if not is_generated_noise_file(normalized) then
+        codecompanion_edited_paths[normalized] = true
+        queued_path = true
+      end
+    end
+    -- A tool may report only generated metadata (for example a source map).
+    -- Do not schedule a delayed refresh/diff for that event.
+    if not queued_path then
+      return
     end
     if codecompanion_diff_timer then
       return
@@ -3018,8 +3800,15 @@ vim.api.nvim_create_autocmd("User", {
           end)
         end
       end
-      open_edited_files_in_center(ordered_paths)
-      open_codex_diff(first_edited_path)
+      local focused_win = vim.api.nvim_get_current_win()
+      local focused_buf = vim.api.nvim_win_get_buf(focused_win)
+      local focused_mode = vim.api.nvim_get_mode().mode
+      local preserve_focus = codex_terminal_buffer(focused_buf)
+        or codecompanion_input_window(focused_win)
+        or focused_mode:match("^[it]") ~= nil
+      local preview_opts = { preserve_focus = preserve_focus }
+      open_edited_files_in_center(ordered_paths, preview_opts)
+      open_codex_diff(first_edited_path, preview_opts)
     end, 350)
   end,
 })
@@ -3101,6 +3890,9 @@ local function ignored_codex_edit_path(root, path)
     return true
   end
   path = vim.fn.fnamemodify(path, ":p")
+  if is_generated_noise_file(path) then
+    return true
+  end
   local relative = vim.fs and vim.fs.relpath and vim.fs.relpath(root, path)
   if not relative or relative == "" then
     return true
@@ -3157,16 +3949,24 @@ local function flush_codex_edit_watch()
     return
   end
 
-  -- Always return to the single centre-editor surface.  If a previous
-  -- explicit Diffview is open, open_codex_diff closes it before selecting the
-  -- changed file and enabling the inline overlay.
-  open_edited_files_in_center({ first_path })
+  -- Always update the single centre-editor surface. If the user is typing in
+  -- Codex (or another terminal/input prompt), keep that window and insert
+  -- mode active while the changed file is prepared in the background.
+  -- Otherwise the normal automatic preview is allowed to focus the centre.
+  local focused_win = vim.api.nvim_get_current_win()
+  local focused_buf = vim.api.nvim_win_get_buf(focused_win)
+  local focused_mode = vim.api.nvim_get_mode().mode
+  local preserve_focus = codex_terminal_buffer(focused_buf)
+    or codecompanion_input_window(focused_win)
+    or focused_mode:match("^[it]") ~= nil
+  local preview_opts = { preserve_focus = preserve_focus }
+  open_edited_files_in_center({ first_path }, preview_opts)
   if package.loaded["gitsigns"] then
     pcall(function()
       require("gitsigns").refresh()
     end)
   end
-  open_codex_diff(first_path)
+  open_codex_diff(first_path, preview_opts)
 end
 
 local function queue_codex_edit_path(path)
@@ -3602,10 +4402,18 @@ require("lazy").setup({
         auto_install = false,
         highlight = {
           enable = true,
+          disable = function(_, bufnr)
+            return vim.b[bufnr].personal_large_file == true
+              or vim.api.nvim_buf_line_count(bufnr) > 30000
+          end,
           additional_vim_regex_highlighting = false,
         },
         indent = {
           enable = true,
+          disable = function(_, bufnr)
+            return vim.b[bufnr].personal_large_file == true
+              or vim.api.nvim_buf_line_count(bufnr) > 30000
+          end,
         },
       })
 
@@ -3739,23 +4547,7 @@ require("lazy").setup({
     dependencies = { "nvim-tree/nvim-web-devicons" },
     opts = function()
       local function close_buffer(bufnr)
-        local ok, bufremove = pcall(require, "mini.bufremove")
-        if ok and type(bufremove.delete) == "function" then
-          return bufremove.delete(bufnr, false)
-        end
-
-        if vim.api.nvim_buf_is_valid(bufnr) then
-          local modified = vim.bo[bufnr].modified
-          if modified then
-            local choice = vim.fn.confirm("Dosyada kaydedilmemiş değişiklik var", "&Kaydet\n&Kapat\n&İptal", 1)
-            if choice == 1 then
-              vim.api.nvim_buf_call(bufnr, function() vim.cmd("update") end)
-            elseif choice ~= 2 then
-              return
-            end
-          end
-          vim.api.nvim_buf_delete(bufnr, { force = false })
-        end
+        return close_buffer_safely(bufnr)
       end
 
       return {
@@ -3803,6 +4595,12 @@ require("lazy").setup({
           middle_mouse_command = close_buffer,
           custom_filter = function(bufnr)
             if not vim.api.nvim_buf_is_valid(bufnr) then
+              return false
+            end
+            local buffer_path = vim.api.nvim_buf_get_name(bufnr)
+            local codex_source_path = vim.b[bufnr].codex_diff_file_path
+            if (buffer_path ~= "" and is_generated_noise_file(buffer_path))
+                or (type(codex_source_path) == "string" and is_generated_noise_file(codex_source_path)) then
               return false
             end
             local buftype = vim.bo[bufnr].buftype
@@ -4170,7 +4968,15 @@ require("lazy").setup({
           enable = true,
           ignore = true,
         },
-        filters = { dotfiles = false },
+        -- Hide generated metadata and bundles at the source.  A custom
+        -- function (rather than a short glob list) also covers nested tracked
+        -- artifacts that Git cannot hide through `git_ignored = true`.
+        filters = {
+          dotfiles = false,
+          custom = function(path)
+            return is_generated_noise_file(path)
+          end,
+        },
       })
     end,
   },
@@ -4196,6 +5002,9 @@ require("lazy").setup({
       max_file_length = 30000,
       update_debounce = 100,
       on_attach = function(buffer)
+        if vim.b[buffer].personal_large_file == true then
+          return false
+        end
         local path = vim.api.nvim_buf_get_name(buffer)
         local stat = path ~= "" and uv.fs_stat(path) or nil
         -- Keep gitsigns useful for source files while skipping very large
