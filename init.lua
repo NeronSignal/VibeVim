@@ -2183,7 +2183,7 @@ _G.NvimDiffNavigateClick = function(minwid, clicks)
   end
   vim.g.personal_nvim_diff_click = { id = id, at = now }
   vim.schedule(function()
-    local winid = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+    local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
     if not vim.api.nvim_win_is_valid(winid) then
       return
     end
@@ -2589,12 +2589,66 @@ local terminal_sessions = {}
 local terminal_session_order = {}
 local terminal_session_next_id = 1
 local terminal_session_bar
+-- All generic terminal sessions share one right-hand editor window.  Their
+-- jobs remain alive in hidden terminal buffers; switching a tab only swaps
+-- that buffer into this window and therefore cannot create another split.
+local terminal_panel_win
 
 local function valid_terminal_session(session)
   return type(session) == "table"
     and session.term
-    and type(session.term.buf_valid) == "function"
-    and session.term:buf_valid()
+    and session.buf
+    and vim.api.nvim_buf_is_valid(session.buf)
+end
+
+local function next_terminal_session(exclude_id)
+  for _, candidate_id in ipairs(terminal_session_order) do
+    if candidate_id ~= exclude_id and valid_terminal_session(terminal_sessions[candidate_id]) then
+      return terminal_sessions[candidate_id]
+    end
+  end
+end
+
+-- Snacks keeps a small window object for every terminal.  Since our sessions
+-- intentionally share one Neovim window, detach the old object's ownership
+-- before swapping buffers; otherwise its internal BufWipeout handler could
+-- later close the shared panel (or wipe the newly selected terminal).
+local function detach_terminal_panel_owner()
+  if not terminal_panel_win or not vim.api.nvim_win_is_valid(terminal_panel_win) then
+    return
+  end
+  local visible_buf = vim.api.nvim_win_get_buf(terminal_panel_win)
+  for _, session in pairs(terminal_sessions) do
+    if session.buf == visible_buf and session.term then
+      session.term.win = nil
+      session.term.buf = session.buf
+    end
+  end
+end
+
+local function set_terminal_panel_buffer(session)
+  if not session or not session.buf or not vim.api.nvim_buf_is_valid(session.buf) then
+    return false
+  end
+  if not terminal_panel_win or not vim.api.nvim_win_is_valid(terminal_panel_win) then
+    return false
+  end
+  detach_terminal_panel_owner()
+  local ok = pcall(vim.api.nvim_win_set_buf, terminal_panel_win, session.buf)
+  if not ok then
+    return false
+  end
+  -- BufWinEnter handlers from older Snacks objects may have run during the
+  -- swap. Restore each object's canonical buffer/window pair afterwards.
+  for _, candidate in pairs(terminal_sessions) do
+    if candidate.term then
+      candidate.term.buf = candidate.buf
+      candidate.term.win = candidate == session and terminal_panel_win or nil
+    end
+  end
+  session.term.win = terminal_panel_win
+  vim.wo[terminal_panel_win].winbar = "%{%v:lua.NvimControlBar()%}"
+  return true
 end
 
 local function redraw_terminal_bars()
@@ -2604,6 +2658,10 @@ local function redraw_terminal_bars()
 end
 
 local function remove_terminal_session(id)
+  local session = terminal_sessions[id]
+  local was_active = session and terminal_panel_win
+    and vim.api.nvim_win_is_valid(terminal_panel_win)
+    and vim.api.nvim_win_get_buf(terminal_panel_win) == session.buf
   terminal_sessions[id] = nil
   for index, value in ipairs(terminal_session_order) do
     if value == id then
@@ -2611,15 +2669,20 @@ local function remove_terminal_session(id)
       break
     end
   end
-  redraw_terminal_bars()
-end
-
-local function hide_terminal_sessions(except_id)
-  for id, session in pairs(terminal_sessions) do
-    if id ~= except_id and valid_terminal_session(session) then
-      pcall(session.term.hide, session.term)
+  if was_active and vim.api.nvim_win_is_valid(terminal_panel_win) then
+    -- A process may exit while its tab is visible.  Move to another live
+    -- session in the same window; never open a replacement split.
+    local replacement = next_terminal_session(id)
+    if replacement then
+      set_terminal_panel_buffer(replacement)
+    else
+      -- The last process exited on its own.  Do not leave an empty terminal
+      -- split behind; a later [+ Term] creates a fresh panel when requested.
+      pcall(vim.api.nvim_win_close, terminal_panel_win, true)
+      terminal_panel_win = nil
     end
   end
+  redraw_terminal_bars()
 end
 
 local function focus_terminal_session(id)
@@ -2628,13 +2691,18 @@ local function focus_terminal_session(id)
     remove_terminal_session(id)
     return nil
   end
-  hide_terminal_sessions(id)
+  local panel = terminal_panel_win
+  if not panel or not vim.api.nvim_win_is_valid(panel) then
+    panel = session.term.win
+  end
+  if not panel or not vim.api.nvim_win_is_valid(panel) then
+    return nil
+  end
+  terminal_panel_win = panel
   local ok = pcall(function()
-    session.term:show():focus()
-    if session.term.win and vim.api.nvim_win_is_valid(session.term.win) then
-      vim.api.nvim_set_current_win(session.term.win)
-      vim.cmd("startinsert")
-    end
+    set_terminal_panel_buffer(session)
+    vim.api.nvim_set_current_win(panel)
+    vim.cmd("startinsert")
   end)
   if not ok then
     return nil
@@ -2647,12 +2715,34 @@ local function close_terminal_session(id)
   if not session then
     return
   end
-  if valid_terminal_session(session) then
-    pcall(session.term.close, session.term)
-  elseif session.buf and vim.api.nvim_buf_is_valid(session.buf) then
+
+  -- `snacks.terminal:close()` also closes its associated window.  That is
+  -- correct for standalone terminals but wrong for our shared right panel: a
+  -- close click must remove only this buffer and keep the panel for the next
+  -- session.
+  local was_active = terminal_panel_win and vim.api.nvim_win_is_valid(terminal_panel_win)
+    and vim.api.nvim_win_get_buf(terminal_panel_win) == session.buf
+  local replacement = was_active and next_terminal_session(id) or nil
+  -- Deleting a terminal buffer while it is displayed also closes its window.
+  -- Select the replacement (or close the panel) first so the shared surface
+  -- survives a tab close and the remaining process stays reachable.
+  if was_active and terminal_panel_win and vim.api.nvim_win_is_valid(terminal_panel_win) then
+    if replacement then
+      set_terminal_panel_buffer(replacement)
+    else
+      -- Detach the Snacks object before closing its visible window so its
+      -- own cleanup callback cannot race the explicit buffer deletion below.
+      session.term.win = nil
+      session.term.buf = session.buf
+      pcall(vim.api.nvim_win_close, terminal_panel_win, true)
+      terminal_panel_win = nil
+    end
+  end
+  if session.buf and vim.api.nvim_buf_is_valid(session.buf) then
     pcall(vim.api.nvim_buf_delete, session.buf, { force = true })
   end
   remove_terminal_session(id)
+  redraw_terminal_bars()
 end
 
 local function terminal_command_parts(command)
@@ -2682,21 +2772,36 @@ local function open_terminal_session(command, label)
   local parts = terminal_command_parts(command)
   local id = terminal_session_next_id
   terminal_session_next_id = terminal_session_next_id + 1
-  hide_terminal_sessions()
-
+  local reuse_panel = terminal_panel_win
+    and vim.api.nvim_win_is_valid(terminal_panel_win)
+    and vim.api.nvim_win_get_tabpage(terminal_panel_win) == vim.api.nvim_get_current_tabpage()
+  if reuse_panel then
+    -- Snacks' `position = current` reuses the existing right pane.  Move focus
+    -- there before opening so it does not accidentally replace the editor or
+    -- file tree when [+ Term] is clicked from another pane.
+    detach_terminal_panel_owner()
+    pcall(vim.api.nvim_set_current_win, terminal_panel_win)
+  end
   local term = Snacks.terminal.open(parts, {
     count = 8000 + id,
     cwd = vim.fn.getcwd(),
     interactive = true,
+    -- The default interactive mode enables Snacks' auto-close hook.  That hook
+    -- treats a normal shell status such as -1 (SIGHUP when switching/closing
+    -- a PTY) as an error and prints the disruptive "Terminal exited..." modal.
+    -- Sessions are closed explicitly through the strip instead.
+    auto_close = false,
     win = {
-      -- Keep all independent terminals in the right-hand work area.  The
-      -- winbar rendered by NvimControlBar() acts as their tab strip, while
-      -- the centre editor and file tabs retain their full height.
-      position = "right",
+      -- Keep one independent terminal surface in the right-hand work area.
+      -- Once it exists, `current` swaps only the terminal buffer into that
+      -- window; it never creates a second split/pane.
+      position = reuse_panel and "current" or "right",
       width = 0.34,
       height = 0,
       relative = "editor",
       stack = false,
+      fixbuf = false,
+      enter = true,
       border = "rounded",
       title = " " .. (label or parts[1] or "Terminal") .. " ",
       title_pos = "center",
@@ -2706,6 +2811,7 @@ local function open_terminal_session(command, label)
     vim.notify("Terminal baslatilamadi", vim.log.levels.WARN)
     return nil
   end
+  terminal_panel_win = term.win or terminal_panel_win
 
   local session = {
     id = id,
@@ -2725,9 +2831,9 @@ local function open_terminal_session(command, label)
   pcall(term.on, term, "BufWipeout", function()
     remove_terminal_session(id)
   end, { buf = true })
-  if term.win and vim.api.nvim_win_is_valid(term.win) then
-    vim.wo[term.win].winbar = "%{%v:lua.NvimControlBar()%}"
-    vim.api.nvim_set_current_win(term.win)
+  if terminal_panel_win and vim.api.nvim_win_is_valid(terminal_panel_win) then
+    set_terminal_panel_buffer(session)
+    vim.api.nvim_set_current_win(terminal_panel_win)
   end
   vim.cmd("startinsert")
   redraw_terminal_bars()
@@ -2770,7 +2876,7 @@ local function new_terminal_session()
 end
 
 terminal_session_bar = function()
-  local winid = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+  local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
   local current_id
   if vim.api.nvim_win_is_valid(winid) then
     current_id = tonumber(vim.b[vim.api.nvim_win_get_buf(winid)].personal_terminal_id)
@@ -2794,7 +2900,11 @@ _G.TerminalSessionClick = function(minwid, _, button)
     if id == 8990 then
       new_terminal_session()
     elseif id == 8991 then
-      local winid = vim.api.nvim_get_current_win()
+      -- Winbar clicks report the clicked window through statusline_winid; the
+      -- current window may still be the editor while the mouse is over the
+      -- terminal strip.  Resolve the session from that target so [X] closes
+      -- the terminal tab instead of accidentally doing nothing.
+      local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
       local buf = vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) or 0
       close_terminal_session(tonumber(vim.b[buf].personal_terminal_id))
     elseif id >= 8100 then
@@ -2963,6 +3073,10 @@ local function open_codex_agent(id)
       FORCE_CODE_TERMINAL = "true",
     },
     interactive = true,
+    -- Keep a non-zero/negative PTY exit from becoming a disruptive Snacks
+    -- "Terminal exited with code ..." error modal.  The agent strip owns
+    -- lifecycle/close actions for these buffers.
+    auto_close = false,
     win = {
       position = "right",
       width = 0.34,
@@ -3041,7 +3155,7 @@ local function codex_agent_current_id(winid)
 end
 
 codex_agent_bar = function()
-  local winid = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+  local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
   local active_id = codex_agent_current_id(winid)
   local parts = { "%#TabLine#  " }
   local main_active = active_id == nil and codex_main_terminal_win() == winid
@@ -3547,7 +3661,7 @@ end
 -- glyphs.  Neovim 0.12 evaluates winbar like a statusline; the %@ segments
 -- are clickable where the UI supports statusline click handlers.
 local function control_winbar()
-  local winid = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+  local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) or vim.api.nvim_get_current_buf()
   local ft = vim.bo[buf].filetype
   if vim.b[buf].personal_terminal_id then
@@ -4210,7 +4324,7 @@ close_modal_window = function(winid)
 end
 
 _G.NvimModalCloseClick = function()
-  local winid = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+  local winid = tonumber(vim.v.statusline_winid) or vim.api.nvim_get_current_win()
   vim.schedule(function()
     close_modal_window(winid)
   end)

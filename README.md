@@ -13,7 +13,7 @@ The screenshot shows the intended three-pane workflow: project files on the left
 - **Codex in the editor**: embedded Codex terminal, multiple Codex agent tabs, YOLO-aware diff approval, automatic scroll-to-input, and file changes opened in the centre editor.
 - **Reliable inline diffs**: the current file remains the only centre buffer; additions are green and removed/reference text is red regardless of the selected theme. Git index/HEAD snapshots are used as the comparison baseline, including untracked files.
 - **Mouse-friendly file workflow**: NvimTree, clickable header/menu, buffer tabs with a visible x, middle-click closing, and safe routing of file-tab clicks away from terminal panels.
-- **Independent terminals**: create separate Shell, Codex, OpenCode, Claude Code, or custom command sessions without replacing the managed Codex pane.
+- **Independent terminals**: create separate Shell, Codex, OpenCode, Claude Code, or custom command sessions in one shared right-hand terminal panel; switching tabs never adds another split or replaces the editor. A normal PTY exit is handled quietly.
 - **Rich previews**: Glimpse previews images, video, archives, SQLite, documents, diagrams, and other formats when the terminal/protocol and optional tools are available.
 - **Quiet generated files**: source maps, `tsbuildinfo`, minified/bundle output,
   lock/cache/debug-log metadata, and common build directories stay out of the tree,
@@ -93,6 +93,8 @@ MIT. See LICENSE.
 # Neovim Codex Workbench (Türkçe)
 
 Yapay zekâ destekli kodlama için fare kullanımını kolaylaştıran, masaüstü tarzı bir Neovim yapılandırmasıdır. Dosya ağacı, merkez editör, Codex oturumları, bağımsız terminal sekmeleri, Git/Codex satır içi diff, medya önizleme ve tanı araçları tek düzende çalışır.
+Shell, Codex, OpenCode ve Claude oturumları sağdaki tek terminal panelinde sekme
+olarak tutulur; yeni terminal açmak ek bir pencere/split oluşturmaz.
 
 Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
 

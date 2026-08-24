@@ -20,10 +20,15 @@ istek önce buraya eklenir; doğrulanmadan tamamlandı olarak işaretlenmez.
 
 ## Terminal ve agent sekmeleri
 
-- [x] Bağımsız terminali altta split yerine sağda sekmeli açma.
+- [x] Bağımsız terminali altta split yerine sağda sekmeli açma; tüm Shell/Codex/
+      OpenCode/Claude oturumlarını tek ortak terminal penceresinde buffer
+      değiştirerek gösterme.
 - [x] Sağ terminal şeridinde + Term, Shell/Codex/OpenCode/Claude ve X.
 - [x] Birden fazla terminal/agent oturumunu arka planda koruyup hızlı geçiş.
 - [x] Yeni terminalde kullanıcının seçtiği komutu çalıştırabilme.
+- [x] [+ Term] ile yeni terminal açarken mevcut sağ paneli yeniden kullanma;
+      sekme değişiminde pencere sayısını artırmama ve [X] ile yalnızca aktif
+      terminal buffer'ını kapatma.
 - [x] Codex ana oturumu ve ek Codex agent sekmeleri.
 - [ ] Terminal sekmelerinin mevcut aktif terminali kapatmadan yeniden
       başlatma/geri yükleme senaryolarını farklı shell'lerde doğrulamak.
