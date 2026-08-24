@@ -42,6 +42,25 @@ nvim
 
 lazy.nvim bootstraps itself on the first launch and installs the declared plugins. If you already manage Neovim with another distribution, copy init.lua and lazy-lock.json into a test profile first rather than replacing your existing setup.
 
+### Install with npm
+
+The repository includes a zero-dependency installer CLI. After the `vibevim` package is published, install it globally and activate the Neovim configuration:
+
+~~~bash
+npm install --global vibevim
+vibevim install
+nvim
+~~~
+
+Until the npm release is published, the same CLI can be installed directly from GitHub:
+
+~~~bash
+npm install --global github:NeronSignal/VibeVim
+vibevim install
+~~~
+
+`vibevim install` keeps an existing `~/.config/nvim` (or the platform equivalent) as a timestamped backup. Use `vibevim install --yes` for scripted setup and `vibevim doctor` to check Neovim/Git and the active config.
+
 ### Codex credentials and provider settings
 
 No credentials are stored in this repository. Configure the Codex CLI using its normal login/configuration flow, or provide your own OpenAI-compatible provider through environment variables before starting Neovim. The configuration recognises CODEX_MODEL, CODEX_THOUGHT_LEVEL, CODEX_MODEL_PROVIDER, CODEX_OCEANAPI_BASE_URL, CODECOMPANION_OCEANAPI_URL, and OCEANAPI_API_KEY.
@@ -105,5 +124,17 @@ metadata ve yaygın build klasörleri dosya ağacında, sekmelerde ve otomatik C
 diff önizlemesinde gösterilmez; gerektiğinde `:edit` ile açıkça açabilirsiniz.
 
 Kurulum için mevcut ~/.config/nvim klasörünü yedekleyip depoyu klonlayın. Eklentiler ilk açılışta lazy.nvim tarafından kurulur. API anahtarlarını repoya yazmayın; Codex girişini ve sağlayıcı ayarlarını ortam değişkenleri veya kendi Codex yapılandırmanız üzerinden yapın.
+
+### npm ile global kurulum
+
+Paket npm’de yayınlandığında arkadaşınız şu komutlarla kurabilir:
+
+~~~bash
+npm install --global vibevim
+vibevim install
+nvim
+~~~
+
+Paket yayınlanmadan GitHub sürümünü kullanmak için `npm install --global github:NeronSignal/VibeVim` komutu da çalışır. `vibevim install` mevcut Neovim ayarlarını tarih damgalı bir yedeğe taşır; otomasyon için `--yes`, ortam kontrolü için `vibevim doctor` kullanılabilir.
 
 Katkı göndermek için bir branch açın, temiz bir test profiliyle Neovim'i başlatın ve işletim sistemi/terminal/Neovim sürümünü açıklayın. Gizli anahtarları, özel endpoint'leri ve proje loglarını commit etmeyin.

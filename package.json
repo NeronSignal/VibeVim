@@ -1,0 +1,41 @@
+{
+  "name": "vibevim",
+  "version": "0.1.0",
+  "description": "Mouse-friendly Neovim workbench for Codex and AI-assisted coding",
+  "type": "commonjs",
+  "bin": {
+    "vibevim": "bin/vibevim.js"
+  },
+  "files": [
+    "init.lua",
+    "lazy-lock.json",
+    "lua",
+    "assets",
+    "bin",
+    "README.md",
+    "LICENSE",
+    "TODO.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "neovim",
+    "nvim",
+    "codex",
+    "ai-coding",
+    "vim"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NeronSignal/VibeVim.git"
+  },
+  "homepage": "https://github.com/NeronSignal/VibeVim",
+  "bugs": {
+    "url": "https://github.com/NeronSignal/VibeVim/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node bin/vibevim.js --self-test"
+  }
+}
