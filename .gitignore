@@ -1,0 +1,21 @@
+# Local/editor state
+*.swp
+*.swo
+*.swn
+*.tmp
+*.bak
+*.bak-*
+.DS_Store
+
+# Neovim runtime state should stay outside the repository.
+shada/
+undo/
+view/
+backup/
+spell/
+plugin/packer_compiled.lua
+
+# Local machine overrides and generated plugin data.
+local.lua
+lazy-lock.local.json
+lazy-lock.json.bak
