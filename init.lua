@@ -3309,7 +3309,6 @@ require("lazy").setup({
     },
     config = function(_, opts)
       require("catppuccin").setup(opts)
-      vim.cmd.colorscheme("catppuccin-mocha")
     end,
   },
 
@@ -3334,8 +3333,13 @@ require("lazy").setup({
   {
     "kepano/flexoki-neovim",
     name = "flexoki",
-    -- Yedek tema; :ThemeFlexoki ile talep üzerine yüklensin.
-    lazy = true,
+    -- Flexoki Dark is the stable default.  Other themes remain available
+    -- through :ThemeSelect and are loaded on demand when selected.
+    lazy = false,
+    priority = 900,
+    config = function()
+      vim.cmd.colorscheme("flexoki-dark")
+    end,
   },
 
   {

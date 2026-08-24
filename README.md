@@ -12,7 +12,7 @@ The default interface is intentionally usable without memorising a leader-key pr
 - **Independent terminals**: create separate Shell, Codex, OpenCode, Claude Code, or custom command sessions without replacing the managed Codex pane.
 - **Rich previews**: Glimpse previews images, video, archives, SQLite, documents, diagrams, and other formats when the terminal/protocol and optional tools are available.
 - **Navigation and diagnostics**: Treesitter highlighting/indentation, Trouble, GitSigns, Diffview, Browse, and mini.nvim utilities.
-- **Themes**: Catppuccin, Kanagawa, and Flexoki dark/light choices are available from the header or :ThemeSelect.
+- **Themes**: Flexoki Dark is the default; Catppuccin, Kanagawa, and Flexoki dark/light choices are available from the header or :ThemeSelect.
 - **Console transcripts**: console-*.log buffers are presented without editor line numbers/sign noise and highlight timestamps, URLs, and log levels.
 
 ## Requirements
@@ -87,6 +87,8 @@ MIT. See LICENSE.
 Yapay zekâ destekli kodlama için fare kullanımını kolaylaştıran, masaüstü tarzı bir Neovim yapılandırmasıdır. Dosya ağacı, merkez editör, Codex oturumları, bağımsız terminal sekmeleri, Git/Codex satır içi diff, medya önizleme ve tanı araçları tek düzende çalışır.
 
 Eklenen kod her temada **yeşil**, çıkarılan/eski referans kodu **kırmızı** gösterilir. console-*.log dosyaları satır numarası karmaşası olmadan console görünümünde açılır; ERROR, WARN, INFO ve LOG seviyeleri renklendirilir.
+
+Varsayılan tema Flexoki Dark'tır; header'daki tema düğmesinden veya :ThemeSelect komutundan diğer koyu/açık temalara geçebilirsiniz.
 
 Kurulum için mevcut ~/.config/nvim klasörünü yedekleyip depoyu klonlayın. Eklentiler ilk açılışta lazy.nvim tarafından kurulur. API anahtarlarını repoya yazmayın; Codex girişini ve sağlayıcı ayarlarını ortam değişkenleri veya kendi Codex yapılandırmanız üzerinden yapın.
 
