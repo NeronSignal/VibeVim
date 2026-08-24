@@ -331,26 +331,98 @@ local function scroll_codex_terminal_to_bottom(bufnr)
     return
   end
 
+  local state = codex_scroll_states[bufnr]
+  if not state then
+    return
+  end
+  -- Updating an unfocused terminal window's cursor forces a redraw of that
+  -- pane while Codex is streaming.  The old implementation did this for
+  -- every output batch, which made the right-hand Codex surface visibly
+  -- flicker whenever the user clicked the centre editor.  Keep a pending
+  -- marker and apply the scroll when the Codex window receives focus.  A
+  -- quiet-period flush below also performs one catch-up move after a response
+  -- settles, so the composer remains discoverable without a streaming blink.
+  local current_win = vim.api.nvim_get_current_win()
+  local focused_codex_window = false
+  for _, winid in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(winid)
+        and vim.api.nvim_win_get_buf(winid) == bufnr
+        and winid == current_win then
+      focused_codex_window = true
+      break
+    end
+  end
+  -- A quiet background flush is allowed to move the viewport once after a
+  -- response settles.  During the stream itself we leave the terminal
+  -- completely untouched, which prevents the visible blink caused by a
+  -- cursor move every few milliseconds.
+  local allow_background_flush = state.background_flush == true
+  if not focused_codex_window and not allow_background_flush then
+    state.pending = true
+    state.last_line_count = nil
+    state.force = false
+    return
+  end
+  -- Do not move the terminal cursor/redraw on every byte while another pane
+  -- is focused.  This was the source of the visible Codex flicker.  A line
+  -- count change (or an explicit focus request) is sufficient to pin the
+  -- viewport again.
+  local force = state.force == true
+  if not force and state.last_line_count == line_count then
+    return
+  end
+
   for _, winid in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_is_valid(winid) then
       local ok, visible_buf = pcall(vim.api.nvim_win_get_buf, winid)
       if ok and visible_buf == bufnr then
         -- A zero scrolloff lets the final prompt row use the full terminal
         -- height.  Setting the terminal buffer cursor is safe while another
-        -- pane is focused and makes Neovim redraw the viewport at the bottom.
+        -- pane is focused (or a quiet flush is explicitly due) and makes
+        -- Neovim redraw the viewport at the bottom.
         pcall(function()
           vim.wo[winid].scrolloff = 0
-          vim.api.nvim_win_set_cursor(winid, { line_count, 0 })
+          vim.wo[winid].cursorline = false
+          vim.wo[winid].cursorcolumn = false
+          local cursor = vim.api.nvim_win_get_cursor(winid)
+          if force or cursor[1] ~= line_count then
+            vim.api.nvim_win_set_cursor(winid, { line_count, 0 })
+          end
         end)
       end
     end
   end
+  state.last_line_count = line_count
+  state.force = false
+  state.pending = false
+  state.background_flush = false
 end
 
-local function schedule_codex_terminal_bottom(bufnr, delay)
+local function schedule_codex_terminal_bottom(bufnr, delay, background_flush)
   local state = codex_scroll_states[bufnr]
   if not state then
     return
+  end
+  if delay == 0 then
+    -- A focus request must not wait behind a quiet-period timer scheduled
+    -- while the user was working in another pane.
+    if state.timer then
+      pcall(state.timer.stop, state.timer)
+      pcall(state.timer.close, state.timer)
+      state.timer = nil
+    end
+    state.force = true
+    state.background_flush = false
+  elseif background_flush then
+    state.background_flush = true
+    -- Restart the quiet-period timer for every output batch.  A long turn
+    -- therefore produces no cursor movement until Codex has actually gone
+    -- quiet for the requested interval.
+    if state.timer then
+      pcall(state.timer.stop, state.timer)
+      pcall(state.timer.close, state.timer)
+      state.timer = nil
+    end
   end
   if state.timer then
     return
@@ -359,7 +431,7 @@ local function schedule_codex_terminal_bottom(bufnr, delay)
   state.timer = vim.defer_fn(function()
     state.timer = nil
     scroll_codex_terminal_to_bottom(bufnr)
-  end, delay or 35)
+  end, delay or 120)
 end
 
 local function attach_codex_terminal_scroll(bufnr, attempt)
@@ -397,9 +469,32 @@ local function attach_codex_terminal_scroll(bufnr, attempt)
 
   local attached = vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function()
-      schedule_codex_terminal_bottom(bufnr)
-    end,
-    on_bytes = function()
+      local state = codex_scroll_states[bufnr]
+      -- Never move the background terminal cursor for every output batch while
+      -- another pane owns focus.  A quiet-period timer below performs one
+      -- catch-up scroll after the stream settles (or immediately on WinEnter).
+      local current_win = vim.api.nvim_get_current_win()
+      local codex_focused = false
+      for _, winid in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(winid)
+            and vim.api.nvim_win_get_buf(winid) == bufnr
+            and winid == current_win then
+          codex_focused = true
+          break
+        end
+      end
+      if not codex_focused then
+        if state then
+          state.pending = true
+          state.last_line_count = nil
+        end
+        -- Keep the input discoverable without redrawing the Codex pane while
+        -- every token is arriving.  Resetting this quiet-period timer on each
+        -- batch means a long response gets one catch-up scroll, not hundreds
+        -- of cursor updates.
+        schedule_codex_terminal_bottom(bufnr, 450, true)
+        return
+      end
       schedule_codex_terminal_bottom(bufnr)
     end,
     on_detach = function()
@@ -2624,6 +2719,57 @@ end
 vim.keymap.set({ "n", "t" }, "<C-Tab>", function() cycle_buffer("next") end, { silent = true, desc = "Sonraki dosya sekmesi" })
 vim.keymap.set({ "n", "t" }, "<C-S-Tab>", function() cycle_buffer("previous") end, { silent = true, desc = "Önceki dosya sekmesi" })
 
+-- The control header and file tabs intentionally live on different rows:
+-- the global tabline is the VibeVim action bar, while the centre editor's
+-- winbar renders bufferline immediately underneath it.  This keeps F1/F2/...
+-- above the file tabs instead of hiding actions below them.
+local function control_header_bar()
+  -- tabline spans the whole editor, so use the full screen width here rather
+  -- than the width of whichever split happened to be active while rendering.
+  local width = vim.o.columns
+  local function button(id, label)
+    return string.format("%%%d@v:lua.NvimControlClick@ %s %%T", id, label)
+  end
+
+  if width < 62 then
+    return "%#TabLine#" .. table.concat({
+      button(1, "F1 M"),
+      button(2, "F2 T"),
+      button(3, "F3 A"),
+      button(4, "F4 C"),
+      button(5, "F5 D"),
+      button(8, "F8 ×"),
+      button(9, "TH"),
+      button(10, "T+"),
+    }) .. "%=%#TabLineSel# VibeVim "
+  end
+
+  return "%#TabLine# " .. table.concat({
+    button(1, "[F1] MENU"),
+    button(2, "[F2] TREE"),
+    button(3, "[F3] AG+"),
+    button(4, "[F4] CODEX"),
+    button(5, "[F5] DIFF"),
+    button(6, "[F6] <"),
+    button(7, "[F7] >"),
+    button(8, "[F8] X"),
+    button(9, "[TH] THEME"),
+    button(10, "[T+] TERMINAL"),
+  }) .. "%=%#TabLineSel# VibeVim "
+end
+
+local function file_tabs_bar()
+  local renderer = rawget(_G, "nvim_bufferline")
+  if type(renderer) ~= "function" then
+    return "%#TabLine#  DOSYALAR  "
+  end
+  local ok, rendered = pcall(renderer)
+  if ok and type(rendered) == "string" and rendered ~= "" then
+    return rendered
+  end
+  return "%#TabLine#  DOSYALAR  "
+end
+
 -- The bar is deliberately plain-text/Unicode rather than icon-dependent, so
 -- it remains readable even when a terminal uses a font without Nerd Font
 -- glyphs.  Neovim 0.12 evaluates winbar like a statusline; the %@ segments
@@ -2644,54 +2790,13 @@ local function control_winbar()
   if vim.bo[buf].buftype == "prompt" or ft == "TelescopePrompt" or ft == "lazy" then
     return ""
   end
-  -- Winbars are per-window.  The startup layout intentionally gives the tree
-  -- and Codex panes only a few columns, so a long desktop-style header would
-  -- be truncated until the useful buttons disappeared.  Use compact labels
-  -- in narrow panes and keep the descriptive version for a wide editor.
-  local width = vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_width(winid) or vim.o.columns
-  local function button(id, label)
-    return string.format("%%%d@v:lua.NvimControlClick@ %s %%T", id, label)
+  if ft == "NvimTree" then
+    return "%#TabLine#  Dosyalar  "
   end
-
-  if width < 38 then
-    return "%#TabLine#" .. table.concat({
-      button(1, "F1 M"),
-      button(2, "F2 T"),
-      button(3, "F3 A"),
-      button(4, "F4 C"),
-      button(8, "F8 ×"),
-      button(9, "TH"),
-      button(10, "T+"),
-    })
+  if is_center_editor_window(winid) then
+    return file_tabs_bar()
   end
-
-  if width < 62 then
-    return "%#TabLine#" .. table.concat({
-      button(1, "F1 M"),
-      button(2, "F2 T"),
-      button(3, "F3 A"),
-      button(4, "F4 C"),
-      button(5, "F5 D"),
-      button(6, "F6 <"),
-      button(7, "F7 >"),
-      button(8, "F8 ×"),
-      button(9, "TH"),
-      button(10, "T+"),
-    })
-  end
-
-  return "%#TabLine# " .. table.concat({
-    button(1, "[F1] MENU"),
-    button(2, "[F2] TREE"),
-    button(3, "[F3] AG+"),
-    button(4, "[F4] CODEX"),
-    button(5, "[F5] DIFF"),
-    button(6, "[F6] <"),
-    button(7, "[F7] >"),
-    button(8, "[F8] X"),
-    button(9, "[TH] THEME"),
-    button(10, "[T+] TERMINAL"),
-  }) .. "%=%#TabLineSel# %t "
+  return control_header_bar()
 end
 
 local header_actions = {
@@ -2754,6 +2859,7 @@ _G.NvimControlClick = function(minwid, clicks, button)
   end
 end
 _G.NvimControlBar = control_winbar
+_G.NvimTopHeader = control_header_bar
 vim.opt.winbar = "%{%v:lua.NvimControlBar()%}"
 
 -- Glimpse intentionally restores focus to the explorer after an inline
@@ -3615,6 +3721,18 @@ require("lazy").setup({
   },
 
   {
+    "nvim-tree/nvim-web-devicons",
+    -- Bufferline and nvim-tree both use this provider for file-type glyphs.
+    -- The plugin defaults to no fallback icon, which made terminals without
+    -- a matching Nerd Font look as if icons were missing altogether.
+    lazy = false,
+    opts = { default = true },
+    config = function(_, opts)
+      require("nvim-web-devicons").setup(opts)
+    end,
+  },
+
+  {
     "akinsho/bufferline.nvim",
     version = "*",
     lazy = false,
@@ -3654,9 +3772,9 @@ require("lazy").setup({
           diagnostics = "nvim_lsp",
           -- Give file tabs enough room for their name and close glyph.  The
           -- editor panes remain unchanged; only the tab strip gets wider.
-          max_name_length = 40,
+          max_name_length = 50,
           max_prefix_length = 20,
-          tab_size = 30,
+          tab_size = 40,
           name_formatter = function(buf)
             local source_path = vim.b[buf.bufnr].codex_diff_file_path
             if type(source_path) == "string" and source_path ~= "" then
@@ -3665,6 +3783,11 @@ require("lazy").setup({
             return buf.name
           end,
           always_show_bufferline = true,
+          -- The global tabline is VibeVim's control header.  Keeping
+          -- bufferline in buffer mode and disabling its auto-toggle lets the
+          -- centre editor render the file tabs in its own winbar below that
+          -- header without the plugin reclaiming the global row.
+          auto_toggle_bufferline = false,
           persist_buffer_sort = true,
           hover = { enabled = false },
           -- Route tab clicks to the centre editor even when focus is in the
@@ -3713,6 +3836,17 @@ require("lazy").setup({
           },
         },
       }
+    end,
+    config = function(_, opts)
+      require("bufferline").setup(opts)
+      -- One stable top row for F1/F2/... controls.  The file tabs are rendered
+      -- by NvimControlBar() in the centre editor's winbar, so they can never
+      -- push the controls underneath themselves again.
+      vim.o.showtabline = 2
+      vim.o.tabline = "%{%v:lua.NvimTopHeader()%}"
+      vim.schedule(function()
+        pcall(vim.cmd, "redrawtabline")
+      end)
     end,
   },
 

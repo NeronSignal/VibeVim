@@ -4,6 +4,10 @@ A mouse-friendly, desktop-style Neovim configuration for AI-assisted coding. It 
 
 The default interface is intentionally usable without memorising a leader-key prefix: the header exposes the main actions and global function keys work from normal, insert, visual, and terminal mode.
 
+![VibeVim desktop layout](assets/vibevim.png)
+
+The screenshot shows the intended three-pane workflow: project files on the left, the active document and diff in the centre, and Codex/agent output on the right.
+
 ## Highlights
 
 - **Codex in the editor**: embedded Codex terminal, multiple Codex agent tabs, YOLO-aware diff approval, automatic scroll-to-input, and file changes opened in the centre editor.
