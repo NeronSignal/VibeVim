@@ -28,7 +28,7 @@ Back up an existing configuration, then clone this repository as Neovim's config
 
 ~~~bash
 mv ~/.config/nvim ~/.config/nvim.backup.$(date +%Y%m%d-%H%M%S)
-git clone https://github.com/NeronSignal/nvim-codex-workbench.git ~/.config/nvim
+git clone https://github.com/NeronSignal/VibeVim.git ~/.config/nvim
 nvim
 ~~~
 
