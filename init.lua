@@ -4061,6 +4061,38 @@ require("lazy").setup({
         codex_acp_command = { "npx", "-y", "@agentclientprotocol/codex-acp" }
       end
 
+      -- Keep machine-specific provider endpoints out of the public config.
+      -- An explicit environment variable wins; otherwise reuse the local
+      -- Codex config when it has an oceanapi section, and fall back to the
+      -- public OpenAI-compatible endpoint for a fresh installation.
+      local function resolve_codex_oceanapi_base_url()
+        local explicit = vim.env.CODEX_OCEANAPI_BASE_URL
+        if explicit and vim.trim(explicit) ~= "" then
+          return vim.trim(explicit):gsub("/+$", "")
+        end
+
+        local config_path = vim.fn.expand("~/.codex/config.toml")
+        local ok, lines = pcall(vim.fn.readfile, config_path)
+        if ok and type(lines) == "table" then
+          local in_oceanapi_section = false
+          for _, line in ipairs(lines) do
+            local section = line:match("^%s*%[([^%]]+)%]")
+            if section then
+              in_oceanapi_section = section == "model_providers.oceanapi"
+            elseif in_oceanapi_section then
+              local value = line:match('^%s*base_url%s*=%s*"([^"]+)"')
+                or line:match("^%s*base_url%s*=%s*'([^']+)'")
+              if value and value ~= "" then
+                return value:gsub("/+$", "")
+              end
+            end
+          end
+        end
+        return "https://api.openai.com/v1"
+      end
+
+      local codex_oceanapi_base_url = resolve_codex_oceanapi_base_url()
+
       local codex_acp_config = vim.env.CODEX_ACP_CONFIG
       if not codex_acp_config or codex_acp_config == "" then
         codex_acp_config = vim.json.encode({
@@ -4069,7 +4101,7 @@ require("lazy").setup({
           model_providers = {
             oceanapi = {
               name = "OceanAPI",
-              base_url = vim.env.CODEX_OCEANAPI_BASE_URL or "http://185.254.28.38:8085/v1",
+              base_url = codex_oceanapi_base_url,
               wire_api = "responses",
               env_key = "OCEANAPI_API_KEY",
               requires_openai_auth = true,
@@ -4123,7 +4155,7 @@ require("lazy").setup({
                 name = "oceanapi",
                 formatted_name = "OceanAPI",
                 url = vim.env.CODECOMPANION_OCEANAPI_URL
-                  or "http://185.254.28.38:8085/v1/responses",
+                  or (codex_oceanapi_base_url .. "/responses"),
                 env = { api_key = "OCEANAPI_API_KEY" },
                 schema = {
                   model = { default = vim.env.CODECOMPANION_MODEL or "gpt-5.6-sol" },
